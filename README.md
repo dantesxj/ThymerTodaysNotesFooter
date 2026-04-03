@@ -1,6 +1,8 @@
 # ThymerTodaysNotesFooter
 Footer on journal entries showing records whose date field matches
 
+‼️ _In progress. Created by Claude and someone who knows nothing about coding! Suggestions and support very welcome!_ ‼️
+
 ### FEATURES
 
 - Shows records from configured collections whose date field matches the journal date
