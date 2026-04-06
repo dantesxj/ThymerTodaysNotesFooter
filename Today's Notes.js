@@ -120,11 +120,11 @@ class Plugin extends AppPlugin {
         row.style.cssText = 'display:flex;gap:8px;align-items:center;margin-bottom:6px;';
         const inp = document.createElement('input');
         inp.type  = 'text'; inp.value = field;
-        inp.style.cssText = 'flex:1;padding:7px 10px;border-radius:6px;font-size:13px;background:var(--bg-default,#18181b);color:inherit;border:1px solid var(--border-default,#3f3f46);outline:none;';
+        inp.style.cssText = 'flex:1;padding:7px 10px;border-radius:6px;font-size:13px;background:var(--bg-default,transparent);color:inherit;border:1px solid var(--border-default,currentColor);outline:none;';
         inp.addEventListener('input', () => { s.dateFields[i] = inp.value.trim(); });
         const rm = document.createElement('button');
         rm.textContent = '✕';
-        rm.style.cssText = 'background:none;border:none;color:var(--text-muted,#888);cursor:pointer;font-size:13px;padding:4px 6px;flex-shrink:0;';
+        rm.style.cssText = 'background:none;border:none;color:var(--text-muted,currentColor);cursor:pointer;font-size:13px;padding:4px 6px;flex-shrink:0;';
         rm.addEventListener('click', () => { s.dateFields.splice(i, 1); render(); });
         row.appendChild(inp); row.appendChild(rm);
         dfSec.appendChild(row);
@@ -132,7 +132,7 @@ class Plugin extends AppPlugin {
 
       const addFieldBtn = document.createElement('button');
       addFieldBtn.textContent = '+ Add field name';
-      addFieldBtn.style.cssText = 'padding:6px 12px;background:transparent;border:1px dashed var(--border-default,#3f3f46);border-radius:6px;font-size:12px;color:var(--text-muted,#888);cursor:pointer;margin-top:4px;';
+      addFieldBtn.style.cssText = 'padding:6px 12px;background:transparent;border:1px dashed var(--border-default,currentColor);border-radius:6px;font-size:12px;color:var(--text-muted,currentColor);cursor:pointer;margin-top:4px;';
       addFieldBtn.addEventListener('click', () => { s.dateFields.push(''); render(); });
       dfSec.appendChild(addFieldBtn);
       wrap.appendChild(dfSec);
@@ -144,7 +144,7 @@ class Plugin extends AppPlugin {
 
       collections.forEach(name => {
         const row = document.createElement('div');
-        row.style.cssText = 'display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid rgba(255,255,255,0.04);';
+        row.style.cssText = 'display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid var(--border-default,rgba(0,0,0,0.08));';
         const cb = document.createElement('input');
         cb.type    = 'checkbox';
         cb.checked = !s.excludedCollections.has(name);
@@ -902,11 +902,11 @@ class Plugin extends AppPlugin {
   _cfgLabel(title, subtitle) {
     const wrap = document.createElement('div'); wrap.style.cssText = 'margin-bottom:10px;';
     const t = document.createElement('div'); t.textContent = title;
-    t.style.cssText = 'font-weight:700;font-size:11px;text-transform:uppercase;letter-spacing:0.07em;color:var(--text-muted,#8a7e6a);margin-bottom:4px;';
+    t.style.cssText = 'font-weight:700;font-size:11px;text-transform:uppercase;letter-spacing:0.07em;color:var(--text-muted,currentColor);margin-bottom:4px;';
     wrap.appendChild(t);
     if (subtitle) {
       const s = document.createElement('div'); s.textContent = subtitle;
-      s.style.cssText = 'font-size:12px;color:var(--text-muted,#8a7e6a);';
+      s.style.cssText = 'font-size:12px;color:var(--text-muted,currentColor);';
       wrap.appendChild(s);
     }
     return wrap;
@@ -917,9 +917,9 @@ class Plugin extends AppPlugin {
       .tn-footer {
         margin-top: 16px;
         font-size: 13px;
-        color: #e8e0d0;
-        background-color: rgba(30, 30, 36, 0.60);
-        border: 1px solid rgba(255, 255, 255, 0.10);
+        color: inherit;
+        background-color: var(--bg-default, transparent);
+        border: 1px solid var(--border-default, currentColor);
         border-radius: 10px;
         padding: 12px 16px 10px;
       }
@@ -933,7 +933,7 @@ class Plugin extends AppPlugin {
       .tn-toggle {
         font-size: 13px;
         line-height: 1;
-        color: #8a7e6a;
+        color: var(--text-muted, currentColor);
         cursor: pointer;
         padding: 0 4px;
         min-width: 18px;
@@ -946,25 +946,25 @@ class Plugin extends AppPlugin {
         flex: 1;
       }
       .tn-count {
-        color: #8a7e6a;
+        color: var(--text-muted, currentColor);
         font-size: 12px;
         white-space: nowrap;
         font-variant-numeric: tabular-nums;
       }
       .tn-settings-btn {
         font-size: 13px;
-        color: #8a7e6a;
+        color: var(--text-muted, currentColor);
         cursor: pointer;
         padding: 0 2px;
         opacity: 0;
         transition: opacity 0.15s;
       }
       .tn-footer:hover .tn-settings-btn { opacity: 1; }
-      .tn-settings-btn:hover { color: #e8e0d0; }
+      .tn-settings-btn:hover { color: inherit; }
       .tn-body { padding-bottom: 4px; }
       .tn-loading, .tn-empty {
         font-size: 12px;
-        color: #8a7e6a;
+        color: var(--text-muted, currentColor);
         padding: 4px 0 6px;
         font-style: italic;
       }
@@ -973,7 +973,7 @@ class Plugin extends AppPlugin {
         font-weight: 700;
         letter-spacing: 0.07em;
         text-transform: uppercase;
-        color: #8a7e6a;
+        color: var(--text-muted, currentColor);
         padding: 8px 0 3px;
       }
       .tn-record-group {
@@ -989,24 +989,24 @@ class Plugin extends AppPlugin {
         border-radius: 6px;
         transition: background 0.1s;
       }
-      .tn-record-group:not(.tlr-record-expanded) .tn-row:hover { background: rgba(255,255,255,0.05); }
-      .tn-record-group.tlr-record-expanded .tn-row { background: rgba(255,255,255,0.04); border-radius: 6px 6px 0 0; }
+      .tn-record-group:not(.tlr-record-expanded) .tn-row:hover { background: rgba(0,0,0,0.05); }
+      .tn-record-group.tlr-record-expanded .tn-row { background: rgba(0,0,0,0.04); border-radius: 6px 6px 0 0; }
       .tn-record-name {
         flex: 1;
         min-width: 0;
         text-align: left;
         font-size: 13px;
-        color: #e8e0d0;
+        color: inherit;
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
         cursor: pointer;
         padding: 0;
       }
-      .tn-record-name:hover { color: #fff; }
+      .tn-record-name:hover { opacity: 0.8; }
       .tn-arrow {
         opacity: 0;
-        color: #8a7e6a;
+        color: var(--text-muted, currentColor);
         flex-shrink: 0;
         font-size: 12px;
         cursor: pointer;
@@ -1014,7 +1014,7 @@ class Plugin extends AppPlugin {
         transition: opacity 0.1s;
       }
       .tn-row:hover .tn-arrow { opacity: 1; }
-      .tn-arrow:hover { color: #e8e0d0; }
+      .tn-arrow:hover { color: inherit; }
 
       /* Expand button */
       .tlr-expand-record-btn {
@@ -1026,7 +1026,7 @@ class Plugin extends AppPlugin {
         height: 16px;
         padding: 0;
         font-size: 12px;
-        color: #8a7e6a;
+        color: var(--text-muted, currentColor);
         cursor: pointer;
         border-radius: 0;
         margin: 0;
@@ -1037,21 +1037,21 @@ class Plugin extends AppPlugin {
         vertical-align: middle;
         flex-shrink: 0;
       }
-      .tlr-expand-record-btn:hover { color: #e8e0d0; }
-      .tlr-expand-record-btn.is-expanded { color: var(--color-primary-400,#c4b5fd); }
+      .tlr-expand-record-btn:hover { color: inherit; }
+      .tlr-expand-record-btn.is-expanded { color: var(--color-primary-400, currentColor); }
 
       /* Preview container */
       .tlr-record-preview {
         display: none;
         flex-direction: column;
         margin: 0 0 6px 10px;
-        border-left: 2px solid rgba(255,255,255,0.08);
+        border-left: 2px solid var(--border-default, currentColor);
         padding-left: 8px;
       }
       .tlr-record-expanded .tlr-record-preview { display: flex; }
       .tlr-expand-loading, .tlr-expand-empty {
         font-style: italic;
-        color: #8a7e6a;
+        color: var(--text-muted, currentColor);
         font-size: 12px;
         padding: 4px 0;
       }
@@ -1076,13 +1076,13 @@ class Plugin extends AppPlugin {
         justify-content: center;
         flex-shrink: 0;
         line-height: 1;
-        color: #8a7e6a;
+        color: var(--text-muted, currentColor);
         padding: 0;
         cursor: pointer;
         font-size: 8px;
         transition: color 0.1s;
       }
-      .tlr-preview-toggle:hover { color: #e8e0d0; }
+      .tlr-preview-toggle:hover { color: inherit; }
       .tlr-preview-spacer { width: 14px; min-width: 14px; flex-shrink: 0; display: inline-block; }
       .tlr-preview-children { display: flex; flex-direction: column; }
       .tlr-preview-children.is-hidden { display: none; }
@@ -1092,20 +1092,20 @@ class Plugin extends AppPlugin {
         text-align: left;
         padding: 2px 4px;
         font-size: 12px;
-        color: #c8c0b0;
+        color: inherit;
         line-height: 1.4;
         border-radius: 3px;
         word-break: break-word;
         cursor: pointer;
       }
-      .tlr-expand-line:hover { background: rgba(255,255,255,0.05); color: #e8e0d0; }
+      .tlr-expand-line:hover { background: rgba(0,0,0,0.05); }
 
-      .tn-prefix { color: #8a7e6a; font-size: 11px; flex-shrink: 0; margin-right: 2px; }
-      .tn-line-content strong { color: #e8e0d0; }
+      .tn-prefix { color: var(--text-muted, currentColor); font-size: 11px; flex-shrink: 0; margin-right: 2px; }
+      .tn-line-content strong { font-weight: 600; }
       .tn-line-content em { opacity: 0.8; }
-      .tn-line-content code { font-family: monospace; font-size: 11px; background: rgba(255,255,255,0.06); padding: 0 3px; border-radius: 3px; }
-      .tn-seg-ref  { color: var(--color-primary-400,#c4b5fd); }
-      .tn-seg-link { color: var(--color-primary-400,#c4b5fd); text-decoration: none; }
+      .tn-line-content code { font-family: monospace; font-size: 11px; background: rgba(0,0,0,0.06); padding: 0 3px; border-radius: 3px; }
+      .tn-seg-ref  { color: var(--color-primary-400, currentColor); }
+      .tn-seg-link { color: var(--color-primary-400, currentColor); text-decoration: none; }
       .tn-seg-link:hover { text-decoration: underline; }
     `);
   }
