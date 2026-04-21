@@ -4,6 +4,320 @@
 // icon: ti-calendar-stats
 // ==/Plugin==
 
+
+
+// @generated BEGIN thymer-ext-path-b (source: plugins/plugin-settings/ThymerExtPathBRuntime.js — edit that file, then npm run embed-path-b)
+/**
+ * ThymerExtPathB — shared path-B storage (Plugin Settings collection + localStorage mirror).
+ * Edit this file in the repo, then run `npm run embed-path-b` to refresh embedded copies inside each Path B plugin.
+ *
+ * API: ThymerExtPathB.init({ plugin, pluginId, modeKey, mirrorKeys, label, data, ui })
+ *      ThymerExtPathB.scheduleFlush(plugin, mirrorKeys)
+ *      ThymerExtPathB.openStorageDialog(plugin, { pluginId, modeKey, mirrorKeys, label, data, ui })
+ */
+(function pathBRuntime(g) {
+  if (g.ThymerExtPathB) return;
+
+  const COL_NAME = 'Plugin Settings';
+  const q = [];
+  let busy = false;
+
+  function drain() {
+    if (busy || !q.length) return;
+    busy = true;
+    const job = q.shift();
+    Promise.resolve(typeof job === 'function' ? job() : job)
+      .catch((e) => console.error('[ThymerExtPathB]', e))
+      .finally(() => {
+        busy = false;
+        if (q.length) setTimeout(drain, 450);
+      });
+  }
+
+  function enqueue(job) {
+    q.push(job);
+    drain();
+  }
+
+  async function findColl(data) {
+    try {
+      const all = await data.getAllCollections();
+      return all.find((c) => (c.getName?.() || '') === COL_NAME) || null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  async function readDoc(data, pluginId) {
+    const coll = await findColl(data);
+    if (!coll) return null;
+    let records;
+    try {
+      records = await coll.getAllRecords();
+    } catch (_) {
+      return null;
+    }
+    const r = records.find((x) => (x.text?.('plugin_id') || '').trim() === pluginId);
+    if (!r) return null;
+    let raw = '';
+    try {
+      raw = r.text?.('settings_json') || '';
+    } catch (_) {}
+    if (!raw || !String(raw).trim()) return null;
+    try {
+      return JSON.parse(raw);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  async function writeDoc(data, pluginId, doc) {
+    const coll = await findColl(data);
+    if (!coll) return;
+    const json = JSON.stringify(doc);
+    let records;
+    try {
+      records = await coll.getAllRecords();
+    } catch (_) {
+      return;
+    }
+    let r = records.find((x) => (x.text?.('plugin_id') || '').trim() === pluginId);
+    if (!r) {
+      let guid = null;
+      try {
+        guid = coll.createRecord?.(pluginId);
+      } catch (_) {}
+      if (guid) {
+        for (let i = 0; i < 30; i++) {
+          await new Promise((res) => setTimeout(res, i < 8 ? 100 : 200));
+          try {
+            const again = await coll.getAllRecords();
+            r = again.find((x) => x.guid === guid) || again.find((x) => (x.text?.('plugin_id') || '').trim() === pluginId);
+            if (r) break;
+          } catch (_) {}
+        }
+      }
+    }
+    if (!r) return;
+    try {
+      const pId = r.prop?.('plugin_id');
+      if (pId && typeof pId.set === 'function') pId.set(pluginId);
+    } catch (_) {}
+    try {
+      const pj = r.prop?.('settings_json');
+      if (pj && typeof pj.set === 'function') pj.set(json);
+    } catch (_) {}
+  }
+
+  function showFirstRunDialog(ui, label, preferred, onPick) {
+    const id = 'thymerext-pathb-first-' + Math.random().toString(36).slice(2);
+    const box = document.createElement('div');
+    box.id = id;
+    box.style.cssText =
+      'position:fixed;inset:0;z-index:100000;background:rgba(0,0,0,0.55);display:flex;align-items:center;justify-content:center;padding:16px;';
+    const card = document.createElement('div');
+    card.style.cssText =
+      'max-width:420px;width:100%;background:var(--panel-bg-color,#1d1915);border:1px solid var(--border-default,#3f3f46);border-radius:12px;padding:20px;box-shadow:0 8px 32px rgba(0,0,0,0.5);';
+    const title = document.createElement('div');
+    title.textContent = label + ' — where to store settings?';
+    title.style.cssText = 'font-weight:700;font-size:15px;margin-bottom:10px;';
+    const hint = document.createElement('div');
+    hint.textContent = 'Change later via Command Palette → “Storage location…”';
+    hint.style.cssText = 'font-size:12px;color:var(--text-muted,#888);margin-bottom:16px;line-height:1.45;';
+    const mk = (t, sub, prim) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.style.cssText =
+        'display:block;width:100%;text-align:left;padding:12px 14px;margin-bottom:10px;border-radius:8px;cursor:pointer;font-size:14px;border:1px solid var(--border-default,#3f3f46);background:' +
+        (prim ? 'rgba(167,139,250,0.25)' : 'transparent') +
+        ';color:inherit;';
+      const x = document.createElement('div');
+      x.textContent = t;
+      x.style.fontWeight = '600';
+      b.appendChild(x);
+      if (sub) {
+        const s = document.createElement('div');
+        s.textContent = sub;
+        s.style.cssText = 'font-size:11px;opacity:0.75;margin-top:4px;line-height:1.35;';
+        b.appendChild(s);
+      }
+      return b;
+    };
+    const bLoc = mk('This device only', 'Browser localStorage only.', preferred === 'local');
+    const bSyn = mk('Sync via Plugin Settings', 'Workspace collection “' + COL_NAME + '”.', preferred === 'synced');
+    const fin = (m) => {
+      try {
+        box.remove();
+      } catch (_) {}
+      onPick(m);
+    };
+    bLoc.addEventListener('click', () => fin('local'));
+    bSyn.addEventListener('click', () => fin('synced'));
+    card.appendChild(title);
+    card.appendChild(hint);
+    card.appendChild(bLoc);
+    card.appendChild(bSyn);
+    box.appendChild(card);
+    document.body.appendChild(box);
+  }
+
+  g.ThymerExtPathB = {
+    COL_NAME,
+    enqueue,
+    async init(opts) {
+      const { plugin, pluginId, modeKey, mirrorKeys, label, data, ui } = opts;
+      let mode = null;
+      try {
+        mode = localStorage.getItem(modeKey);
+      } catch (_) {}
+
+      const remote = await readDoc(data, pluginId);
+      if (!mode && remote && (remote.storageMode === 'synced' || remote.storageMode === 'local')) {
+        mode = remote.storageMode;
+        try {
+          localStorage.setItem(modeKey, mode);
+        } catch (_) {}
+      }
+
+      if (!mode) {
+        const coll = await findColl(data);
+        const preferred = coll ? 'synced' : 'local';
+        await new Promise((outerResolve) => {
+          enqueue(async () => {
+            const picked = await new Promise((r) => {
+              showFirstRunDialog(ui, label, preferred, r);
+            });
+            try {
+              localStorage.setItem(modeKey, picked);
+            } catch (_) {}
+            outerResolve(picked);
+          });
+        });
+        try {
+          mode = localStorage.getItem(modeKey);
+        } catch (_) {}
+      }
+
+      plugin._pathBMode = mode === 'synced' ? 'synced' : 'local';
+      plugin._pathBPluginId = pluginId;
+      const keys = typeof mirrorKeys === 'function' ? mirrorKeys() : mirrorKeys;
+
+      if (plugin._pathBMode === 'synced' && remote && remote.payload && typeof remote.payload === 'object') {
+        for (const k of keys) {
+          const v = remote.payload[k];
+          if (typeof v === 'string') {
+            try {
+              localStorage.setItem(k, v);
+            } catch (_) {}
+          }
+        }
+      }
+
+      if (plugin._pathBMode === 'synced') {
+        try {
+          await g.ThymerExtPathB.flushNow(data, pluginId, keys);
+        } catch (_) {}
+      }
+    },
+
+    scheduleFlush(plugin, mirrorKeys) {
+      if (plugin._pathBMode !== 'synced') return;
+      const keys = typeof mirrorKeys === 'function' ? mirrorKeys() : mirrorKeys;
+      if (plugin._pathBFlushTimer) clearTimeout(plugin._pathBFlushTimer);
+      plugin._pathBFlushTimer = setTimeout(() => {
+        plugin._pathBFlushTimer = null;
+        const data = plugin.data;
+        const pid = plugin._pathBPluginId;
+        if (!pid || !data) return;
+        g.ThymerExtPathB.flushNow(data, pid, keys).catch((e) => console.error('[ThymerExtPathB] flush', e));
+      }, 500);
+    },
+
+    async flushNow(data, pluginId, mirrorKeys) {
+      const keys = typeof mirrorKeys === 'function' ? mirrorKeys() : mirrorKeys;
+      const payload = {};
+      for (const k of keys) {
+        try {
+          const v = localStorage.getItem(k);
+          if (v !== null) payload[k] = v;
+        } catch (_) {}
+      }
+      const doc = {
+        v: 1,
+        storageMode: 'synced',
+        updatedAt: new Date().toISOString(),
+        payload,
+      };
+      await writeDoc(data, pluginId, doc);
+    },
+
+    async openStorageDialog(opts) {
+      const { plugin, pluginId, modeKey, mirrorKeys, label, data, ui } = opts;
+      const cur = plugin._pathBMode === 'synced' ? 'synced' : 'local';
+      const pick = await new Promise((resolve) => {
+        const close = (v) => {
+          try {
+            box.remove();
+          } catch (_) {}
+          resolve(v);
+        };
+        const box = document.createElement('div');
+        box.style.cssText =
+          'position:fixed;inset:0;z-index:100000;background:rgba(0,0,0,0.55);display:flex;align-items:center;justify-content:center;padding:16px;';
+        box.addEventListener('click', (e) => {
+          if (e.target === box) close(null);
+        });
+        const card = document.createElement('div');
+        card.style.cssText =
+          'max-width:400px;width:100%;background:var(--panel-bg-color,#1d1915);border:1px solid var(--border-default,#3f3f46);border-radius:12px;padding:18px;';
+        card.addEventListener('click', (e) => e.stopPropagation());
+        const t = document.createElement('div');
+        t.textContent = label + ' — storage';
+        t.style.cssText = 'font-weight:700;margin-bottom:12px;';
+        const b1 = document.createElement('button');
+        b1.type = 'button';
+        b1.textContent = 'This device only';
+        const b2 = document.createElement('button');
+        b2.type = 'button';
+        b2.textContent = 'Sync via Plugin Settings';
+        [b1, b2].forEach((b) => {
+          b.style.cssText =
+            'display:block;width:100%;padding:10px 12px;margin-bottom:8px;border-radius:8px;cursor:pointer;border:1px solid var(--border-default,#3f3f46);background:transparent;color:inherit;text-align:left;';
+        });
+        b1.addEventListener('click', () => close('local'));
+        b2.addEventListener('click', () => close('synced'));
+        const bx = document.createElement('button');
+        bx.type = 'button';
+        bx.textContent = 'Cancel';
+        bx.style.cssText =
+          'margin-top:8px;padding:8px 14px;border-radius:8px;cursor:pointer;border:1px solid var(--border-default,#3f3f46);background:transparent;color:inherit;';
+        bx.addEventListener('click', () => close(null));
+        card.appendChild(t);
+        card.appendChild(b1);
+        card.appendChild(b2);
+        card.appendChild(bx);
+        box.appendChild(card);
+        document.body.appendChild(box);
+      });
+      if (!pick || pick === cur) return;
+      try {
+        localStorage.setItem(modeKey, pick);
+      } catch (_) {}
+      plugin._pathBMode = pick === 'synced' ? 'synced' : 'local';
+      const keys = typeof mirrorKeys === 'function' ? mirrorKeys() : mirrorKeys;
+      if (pick === 'synced') await g.ThymerExtPathB.flushNow(data, pluginId, keys);
+      ui.addToaster?.({
+        title: label,
+        message: 'Storage: ' + (pick === 'synced' ? 'synced' : 'local only'),
+        dismissible: true,
+        autoDestroyTime: 3500,
+      });
+    },
+  };
+
+})(typeof globalThis !== 'undefined' ? globalThis : window);
+// @generated END thymer-ext-path-b
+
 /*
   FEATURES
   - Shows records from configured collections whose date field matches the journal date
@@ -13,7 +327,7 @@
   - Survives DOM rebuilds (recordExpandedState pattern from EXPANDABLE_PREVIEW_PATTERN.md)
   - Re-populates automatically when navigating between journal dates
 
-  SETTINGS stored in localStorage "tn_settings_v1"
+  SETTINGS: localStorage "tn_settings_v1" (+ tn_footer_collapsed), or synced via Plugin Settings (path B — see PLUGIN_SETTINGS_PERSISTENCE.md)
   {
     dateFields: ["When", "when"],      // property names to check for date matching
     excludedCollections: ["Archives"]  // collection names to hide
@@ -22,32 +336,77 @@
 
 const TN_SETTINGS_KEY = 'tn_settings_v1';
 
+/** Staggered queue so multiple path-B plugins do not open first-run dialogs at once. */
+(function pathBFirstRunQueue(g) {
+  if (g.__thymerExtPathBApi) return;
+  const q = [];
+  let busy = false;
+  const runNext = () => {
+    if (busy || !q.length) return;
+    busy = true;
+    const job = q.shift();
+    Promise.resolve(typeof job === 'function' ? job() : job)
+      .catch((e) => console.error('[ThymerExt PathB]', e))
+      .finally(() => {
+        busy = false;
+        if (q.length) setTimeout(runNext, 450);
+      });
+  };
+  g.__thymerExtPathBApi = { enqueue(job) { q.push(job); runNext(); } };
+})(typeof globalThis !== 'undefined' ? globalThis : window);
+
 class Plugin extends AppPlugin {
 
   onLoad() {
-    this._panelStates     = new Map();
-    this._eventHandlerIds = [];
-    this._collapsed       = this._loadBool('tn_footer_collapsed', false);
-    this._settings        = this._loadSettings();
+    (async () => {
+      await (globalThis.ThymerExtPathB?.init?.({
+        plugin: this,
+        pluginId: 'todays-notes',
+        modeKey: 'thymerext_ps_mode_todays-notes',
+        mirrorKeys: () => [TN_SETTINGS_KEY, 'tn_footer_collapsed'],
+        label: "Today's Notes",
+        data: this.data,
+        ui: this.ui,
+      }) ?? (console.warn("[Today's Notes] ThymerExtPathB runtime missing (redeploy full plugin .js from repo)."), Promise.resolve()));
 
-    this._injectCSS();
+      this._panelStates     = new Map();
+      this._eventHandlerIds = [];
+      this._collapsed       = this._loadBool('tn_footer_collapsed', false);
+      this._settings        = this._loadSettings();
 
-    // Register settings panel
-    this.ui.registerCustomPanelType('tn-settings', (panel) => this._mountSettingsPanel(panel));
-    this.ui.addCommandPaletteCommand({
-      label: "Today's Notes: Settings", icon: 'ti-settings',
-      onSelected: () => this._openSettings(),
-    });
+      this._injectCSS();
 
-    this._eventHandlerIds.push(this.events.on('panel.navigated', ev => setTimeout(() => this._handlePanel(ev.panel), 400)));
-    this._eventHandlerIds.push(this.events.on('panel.focused',   ev => this._handlePanel(ev.panel)));
-    this._eventHandlerIds.push(this.events.on('panel.closed',    ev => this._disposePanel(ev.panel?.getId?.())));
-    this._eventHandlerIds.push(this.events.on('record.created',  ()  => this._refreshAll()));
+      // Register settings panel
+      this.ui.registerCustomPanelType('tn-settings', (panel) => this._mountSettingsPanel(panel));
+      this.ui.addCommandPaletteCommand({
+        label: "Today's Notes: Settings", icon: 'ti-settings',
+        onSelected: () => this._openSettings(),
+      });
+      this.ui.addCommandPaletteCommand({
+        label: "Today's Notes: Storage location…", icon: 'ti-database',
+        onSelected: () => {
+        globalThis.ThymerExtPathB?.openStorageDialog?.({
+          plugin: this,
+          pluginId: 'todays-notes',
+          modeKey: 'thymerext_ps_mode_todays-notes',
+          mirrorKeys: () => [TN_SETTINGS_KEY, 'tn_footer_collapsed'],
+          label: "Today's Notes",
+          data: this.data,
+          ui: this.ui,
+        });
+      },
+      });
 
-    setTimeout(() => {
-      const p = this.ui.getActivePanel();
-      if (p) this._handlePanel(p);
-    }, 300);
+      this._eventHandlerIds.push(this.events.on('panel.navigated', ev => setTimeout(() => this._handlePanel(ev.panel), 400)));
+      this._eventHandlerIds.push(this.events.on('panel.focused',   ev => this._handlePanel(ev.panel)));
+      this._eventHandlerIds.push(this.events.on('panel.closed',    ev => this._disposePanel(ev.panel?.getId?.())));
+      this._eventHandlerIds.push(this.events.on('record.created',  ()  => this._refreshAll()));
+
+      setTimeout(() => {
+        const p = this.ui.getActivePanel();
+        if (p) this._handlePanel(p);
+      }, 300);
+    })().catch((e) => console.error("[Today's Notes] onLoad", e));
   }
 
   onUnload() {
@@ -79,6 +438,7 @@ class Plugin extends AppPlugin {
 
   _saveSettings() {
     try { localStorage.setItem(TN_SETTINGS_KEY, JSON.stringify(this._settings)); } catch (_) {}
+    globalThis.ThymerExtPathB?.scheduleFlush?.(this, () => [TN_SETTINGS_KEY, 'tn_footer_collapsed']);
   }
 
   async _openSettings() {
@@ -120,11 +480,11 @@ class Plugin extends AppPlugin {
         row.style.cssText = 'display:flex;gap:8px;align-items:center;margin-bottom:6px;';
         const inp = document.createElement('input');
         inp.type  = 'text'; inp.value = field;
-        inp.style.cssText = 'flex:1;padding:7px 10px;border-radius:6px;font-size:13px;background:var(--bg-default,transparent);color:inherit;border:1px solid var(--border-default,currentColor);outline:none;';
+        inp.style.cssText = 'flex:1;padding:7px 10px;border-radius:6px;font-size:13px;background:var(--bg-default,#18181b);color:inherit;border:1px solid var(--border-default,#3f3f46);outline:none;';
         inp.addEventListener('input', () => { s.dateFields[i] = inp.value.trim(); });
         const rm = document.createElement('button');
         rm.textContent = '✕';
-        rm.style.cssText = 'background:none;border:none;color:var(--text-muted,currentColor);cursor:pointer;font-size:13px;padding:4px 6px;flex-shrink:0;';
+        rm.style.cssText = 'background:none;border:none;color:var(--text-muted,#888);cursor:pointer;font-size:13px;padding:4px 6px;flex-shrink:0;';
         rm.addEventListener('click', () => { s.dateFields.splice(i, 1); render(); });
         row.appendChild(inp); row.appendChild(rm);
         dfSec.appendChild(row);
@@ -132,7 +492,7 @@ class Plugin extends AppPlugin {
 
       const addFieldBtn = document.createElement('button');
       addFieldBtn.textContent = '+ Add field name';
-      addFieldBtn.style.cssText = 'padding:6px 12px;background:transparent;border:1px dashed var(--border-default,currentColor);border-radius:6px;font-size:12px;color:var(--text-muted,currentColor);cursor:pointer;margin-top:4px;';
+      addFieldBtn.style.cssText = 'padding:6px 12px;background:transparent;border:1px dashed var(--border-default,#3f3f46);border-radius:6px;font-size:12px;color:var(--text-muted,#888);cursor:pointer;margin-top:4px;';
       addFieldBtn.addEventListener('click', () => { s.dateFields.push(''); render(); });
       dfSec.appendChild(addFieldBtn);
       wrap.appendChild(dfSec);
@@ -144,7 +504,7 @@ class Plugin extends AppPlugin {
 
       collections.forEach(name => {
         const row = document.createElement('div');
-        row.style.cssText = 'display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid var(--border-default,rgba(0,0,0,0.08));';
+        row.style.cssText = 'display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid rgba(255,255,255,0.04);';
         const cb = document.createElement('input');
         cb.type    = 'checkbox';
         cb.checked = !s.excludedCollections.has(name);
@@ -356,6 +716,11 @@ class Plugin extends AppPlugin {
     toggle.title       = 'Collapse / expand';
     toggle.textContent = this._collapsed ? '+' : '−';
 
+    const titleIcon = document.createElement('span');
+    titleIcon.className = 'tn-title-icon';
+    try { titleIcon.appendChild(this.ui.createIcon('ti-notes')); }
+    catch (_) { titleIcon.textContent = '📝'; }
+
     const titleEl = document.createElement('div');
     titleEl.className   = 'tn-title';
     titleEl.textContent = "Today's Notes";
@@ -372,6 +737,7 @@ class Plugin extends AppPlugin {
     settingsBtn.addEventListener('click', () => this._openSettings());
 
     header.appendChild(toggle);
+    header.appendChild(titleIcon);
     header.appendChild(titleEl);
     header.appendChild(countEl);
     header.appendChild(settingsBtn);
@@ -897,16 +1263,18 @@ class Plugin extends AppPlugin {
   }
   _saveBool(key, val) {
     try { localStorage.setItem(key, val ? 'true' : 'false'); } catch (_) {}
+    globalThis.ThymerExtPathB?.scheduleFlush?.(this, () => [TN_SETTINGS_KEY, 'tn_footer_collapsed']);
   }
+
 
   _cfgLabel(title, subtitle) {
     const wrap = document.createElement('div'); wrap.style.cssText = 'margin-bottom:10px;';
     const t = document.createElement('div'); t.textContent = title;
-    t.style.cssText = 'font-weight:700;font-size:11px;text-transform:uppercase;letter-spacing:0.07em;color:var(--text-muted,currentColor);margin-bottom:4px;';
+    t.style.cssText = 'font-weight:700;font-size:11px;text-transform:uppercase;letter-spacing:0.07em;color:var(--text-muted,#8a7e6a);margin-bottom:4px;';
     wrap.appendChild(t);
     if (subtitle) {
       const s = document.createElement('div'); s.textContent = subtitle;
-      s.style.cssText = 'font-size:12px;color:var(--text-muted,currentColor);';
+      s.style.cssText = 'font-size:12px;color:var(--text-muted,#8a7e6a);';
       wrap.appendChild(s);
     }
     return wrap;
@@ -917,9 +1285,9 @@ class Plugin extends AppPlugin {
       .tn-footer {
         margin-top: 16px;
         font-size: 13px;
-        color: inherit;
-        background-color: var(--bg-default, transparent);
-        border: 1px solid var(--border-default, currentColor);
+        color: #e8e0d0;
+        background-color: rgba(30, 30, 36, 0.60);
+        border: 1px solid rgba(255, 255, 255, 0.10);
         border-radius: 10px;
         padding: 12px 16px 10px;
       }
@@ -933,11 +1301,18 @@ class Plugin extends AppPlugin {
       .tn-toggle {
         font-size: 13px;
         line-height: 1;
-        color: var(--text-muted, currentColor);
+        color: #8a7e6a;
         cursor: pointer;
         padding: 0 4px;
         min-width: 18px;
         flex-shrink: 0;
+      }
+      .tn-title-icon {
+        color: #8a7e6a;
+        font-size: 14px;
+        flex-shrink: 0;
+        display: inline-flex;
+        align-items: center;
       }
       .tn-title {
         font-weight: 600;
@@ -946,25 +1321,25 @@ class Plugin extends AppPlugin {
         flex: 1;
       }
       .tn-count {
-        color: var(--text-muted, currentColor);
+        color: #8a7e6a;
         font-size: 12px;
         white-space: nowrap;
         font-variant-numeric: tabular-nums;
       }
       .tn-settings-btn {
         font-size: 13px;
-        color: var(--text-muted, currentColor);
+        color: #8a7e6a;
         cursor: pointer;
         padding: 0 2px;
         opacity: 0;
         transition: opacity 0.15s;
       }
       .tn-footer:hover .tn-settings-btn { opacity: 1; }
-      .tn-settings-btn:hover { color: inherit; }
+      .tn-settings-btn:hover { color: #e8e0d0; }
       .tn-body { padding-bottom: 4px; }
       .tn-loading, .tn-empty {
         font-size: 12px;
-        color: var(--text-muted, currentColor);
+        color: #8a7e6a;
         padding: 4px 0 6px;
         font-style: italic;
       }
@@ -973,7 +1348,7 @@ class Plugin extends AppPlugin {
         font-weight: 700;
         letter-spacing: 0.07em;
         text-transform: uppercase;
-        color: var(--text-muted, currentColor);
+        color: #8a7e6a;
         padding: 8px 0 3px;
       }
       .tn-record-group {
@@ -989,24 +1364,24 @@ class Plugin extends AppPlugin {
         border-radius: 6px;
         transition: background 0.1s;
       }
-      .tn-record-group:not(.tlr-record-expanded) .tn-row:hover { background: rgba(0,0,0,0.05); }
-      .tn-record-group.tlr-record-expanded .tn-row { background: rgba(0,0,0,0.04); border-radius: 6px 6px 0 0; }
+      .tn-record-group:not(.tlr-record-expanded) .tn-row:hover { background: rgba(255,255,255,0.05); }
+      .tn-record-group.tlr-record-expanded .tn-row { background: rgba(255,255,255,0.04); border-radius: 6px 6px 0 0; }
       .tn-record-name {
         flex: 1;
         min-width: 0;
         text-align: left;
         font-size: 13px;
-        color: inherit;
+        color: #e8e0d0;
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
         cursor: pointer;
         padding: 0;
       }
-      .tn-record-name:hover { opacity: 0.8; }
+      .tn-record-name:hover { color: #fff; }
       .tn-arrow {
         opacity: 0;
-        color: var(--text-muted, currentColor);
+        color: #8a7e6a;
         flex-shrink: 0;
         font-size: 12px;
         cursor: pointer;
@@ -1014,7 +1389,7 @@ class Plugin extends AppPlugin {
         transition: opacity 0.1s;
       }
       .tn-row:hover .tn-arrow { opacity: 1; }
-      .tn-arrow:hover { color: inherit; }
+      .tn-arrow:hover { color: #e8e0d0; }
 
       /* Expand button */
       .tlr-expand-record-btn {
@@ -1026,7 +1401,7 @@ class Plugin extends AppPlugin {
         height: 16px;
         padding: 0;
         font-size: 12px;
-        color: var(--text-muted, currentColor);
+        color: #8a7e6a;
         cursor: pointer;
         border-radius: 0;
         margin: 0;
@@ -1037,21 +1412,27 @@ class Plugin extends AppPlugin {
         vertical-align: middle;
         flex-shrink: 0;
       }
-      .tlr-expand-record-btn:hover { color: inherit; }
-      .tlr-expand-record-btn.is-expanded { color: var(--color-primary-400, currentColor); }
+      .tlr-expand-record-btn:hover { color: #e8e0d0; }
+      .tlr-expand-record-btn.is-expanded { color: var(--color-primary-400,#c4b5fd); }
 
-      /* Preview container */
+      /* Preview container — closer to main record typography */
       .tlr-record-preview {
         display: none;
         flex-direction: column;
         margin: 0 0 6px 10px;
-        border-left: 2px solid var(--border-default, currentColor);
-        padding-left: 8px;
+        border-left: 2px solid rgba(255,255,255,0.08);
+        padding: 6px 8px 8px 12px;
+        border-radius: 0 8px 8px 0;
+        background: rgba(0,0,0,0.12);
+        font-family: var(--font-text, var(--font-family, inherit));
+        font-size: var(--font-size-body, 13px);
+        line-height: 1.45;
+        color: var(--color-text-100, #e8e0d0);
       }
       .tlr-record-expanded .tlr-record-preview { display: flex; }
       .tlr-expand-loading, .tlr-expand-empty {
         font-style: italic;
-        color: var(--text-muted, currentColor);
+        color: #8a7e6a;
         font-size: 12px;
         padding: 4px 0;
       }
@@ -1076,13 +1457,13 @@ class Plugin extends AppPlugin {
         justify-content: center;
         flex-shrink: 0;
         line-height: 1;
-        color: var(--text-muted, currentColor);
+        color: #8a7e6a;
         padding: 0;
         cursor: pointer;
         font-size: 8px;
         transition: color 0.1s;
       }
-      .tlr-preview-toggle:hover { color: inherit; }
+      .tlr-preview-toggle:hover { color: #e8e0d0; }
       .tlr-preview-spacer { width: 14px; min-width: 14px; flex-shrink: 0; display: inline-block; }
       .tlr-preview-children { display: flex; flex-direction: column; }
       .tlr-preview-children.is-hidden { display: none; }
@@ -1090,22 +1471,22 @@ class Plugin extends AppPlugin {
         flex: 1;
         min-width: 0;
         text-align: left;
-        padding: 2px 4px;
-        font-size: 12px;
-        color: inherit;
-        line-height: 1.4;
-        border-radius: 3px;
+        padding: 4px 6px;
+        font-size: var(--font-size-body, 13px);
+        color: var(--color-text-100, #e8e0d0);
+        line-height: 1.45;
+        border-radius: 4px;
         word-break: break-word;
         cursor: pointer;
       }
-      .tlr-expand-line:hover { background: rgba(0,0,0,0.05); }
+      .tlr-expand-line:hover { background: rgba(255,255,255,0.05); color: #e8e0d0; }
 
-      .tn-prefix { color: var(--text-muted, currentColor); font-size: 11px; flex-shrink: 0; margin-right: 2px; }
-      .tn-line-content strong { font-weight: 600; }
+      .tn-prefix { color: #8a7e6a; font-size: 11px; flex-shrink: 0; margin-right: 2px; }
+      .tn-line-content strong { color: #e8e0d0; }
       .tn-line-content em { opacity: 0.8; }
-      .tn-line-content code { font-family: monospace; font-size: 11px; background: rgba(0,0,0,0.06); padding: 0 3px; border-radius: 3px; }
-      .tn-seg-ref  { color: var(--color-primary-400, currentColor); }
-      .tn-seg-link { color: var(--color-primary-400, currentColor); text-decoration: none; }
+      .tn-line-content code { font-family: monospace; font-size: 11px; background: rgba(255,255,255,0.06); padding: 0 3px; border-radius: 3px; }
+      .tn-seg-ref  { color: var(--color-primary-400,#c4b5fd); }
+      .tn-seg-link { color: var(--color-primary-400,#c4b5fd); text-decoration: none; }
       .tn-seg-link:hover { text-decoration: underline; }
     `);
   }
