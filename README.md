@@ -2,6 +2,8 @@
 
 Footer panel for journal pages that shows records whose date fields match the current journal day.
 
+‼️ In progress. Created by AI, vibes, and someone who knows nothing about coding! Suggestions and support very welcome! ‼️
+
 ## Features
 
 - Renders grouped records from configured collections for the active journal date.
