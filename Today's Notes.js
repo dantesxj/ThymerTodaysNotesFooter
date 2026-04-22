@@ -335,6 +335,8 @@
 */
 
 const TN_SETTINGS_KEY = 'tn_settings_v1';
+const TN_PATHB_PLUGIN_ID = 'todays-notes';
+const TN_QUERY_CACHE_TTL_MS = 45000;
 
 /** Staggered queue so multiple path-B plugins do not open first-run dialogs at once. */
 (function pathBFirstRunQueue(g) {
@@ -361,7 +363,7 @@ class Plugin extends AppPlugin {
     (async () => {
       await (globalThis.ThymerExtPathB?.init?.({
         plugin: this,
-        pluginId: 'todays-notes',
+        pluginId: TN_PATHB_PLUGIN_ID,
         modeKey: 'thymerext_ps_mode_todays-notes',
         mirrorKeys: () => [TN_SETTINGS_KEY, 'tn_footer_collapsed'],
         label: "Today's Notes",
@@ -371,6 +373,7 @@ class Plugin extends AppPlugin {
 
       this._panelStates     = new Map();
       this._eventHandlerIds = [];
+      this._recordsByDateCache = new Map();
       this._collapsed       = this._loadBool('tn_footer_collapsed', false);
       this._settings        = this._loadSettings();
 
@@ -387,7 +390,7 @@ class Plugin extends AppPlugin {
         onSelected: () => {
         globalThis.ThymerExtPathB?.openStorageDialog?.({
           plugin: this,
-          pluginId: 'todays-notes',
+          pluginId: TN_PATHB_PLUGIN_ID,
           modeKey: 'thymerext_ps_mode_todays-notes',
           mirrorKeys: () => [TN_SETTINGS_KEY, 'tn_footer_collapsed'],
           label: "Today's Notes",
@@ -400,7 +403,10 @@ class Plugin extends AppPlugin {
       this._eventHandlerIds.push(this.events.on('panel.navigated', ev => setTimeout(() => this._handlePanel(ev.panel), 400)));
       this._eventHandlerIds.push(this.events.on('panel.focused',   ev => this._handlePanel(ev.panel)));
       this._eventHandlerIds.push(this.events.on('panel.closed',    ev => this._disposePanel(ev.panel?.getId?.())));
-      this._eventHandlerIds.push(this.events.on('record.created',  ()  => this._refreshAll()));
+      this._eventHandlerIds.push(this.events.on('record.created', () => this._onWorkspaceDataChanged()));
+      this._eventHandlerIds.push(this.events.on('record.updated', (ev) => this._onRecordUpdatedForNotes(ev)));
+      this._eventHandlerIds.push(this.events.on('record.moved',   () => this._onWorkspaceDataChanged()));
+      // Thymer EventsAPI has no record.deleted; rely on record.updated / record.moved / panel events for refresh.
 
       setTimeout(() => {
         const p = this.ui.getActivePanel();
@@ -410,10 +416,15 @@ class Plugin extends AppPlugin {
   }
 
   onUnload() {
+    if (this._workspaceDataDebounceTimer) {
+      try { clearTimeout(this._workspaceDataDebounceTimer); } catch (_) {}
+      this._workspaceDataDebounceTimer = null;
+    }
     for (const id of (this._eventHandlerIds || [])) {
       try { this.events.off(id); } catch (_) {}
     }
     this._eventHandlerIds = [];
+    this._recordsByDateCache?.clear?.();
     for (const id of Array.from((this._panelStates || new Map()).keys())) this._disposePanel(id);
     this._panelStates?.clear();
   }
@@ -438,7 +449,70 @@ class Plugin extends AppPlugin {
 
   _saveSettings() {
     try { localStorage.setItem(TN_SETTINGS_KEY, JSON.stringify(this._settings)); } catch (_) {}
+    this._invalidateRecordsCache();
     globalThis.ThymerExtPathB?.scheduleFlush?.(this, () => [TN_SETTINGS_KEY, 'tn_footer_collapsed']);
+  }
+
+  _settingsCacheSignature() {
+    const fields = Array.isArray(this._settings?.dateFields) ? this._settings.dateFields : [];
+    const excluded = Array.isArray(this._settings?.excludedCollections) ? this._settings.excludedCollections : [];
+    const f = fields.map((x) => String(x || '').trim().toLowerCase()).filter(Boolean).sort();
+    const e = excluded.map((x) => String(x || '').trim().toLowerCase()).filter(Boolean).sort();
+    return JSON.stringify({ f, e });
+  }
+
+  _invalidateRecordsCache() {
+    try { this._recordsByDateCache?.clear?.(); } catch (_) {}
+  }
+
+  /**
+   * Path B plugins sync via a row in "Plugin Settings" (plugin_id + settings_json).
+   * Those updates must not rebuild Today's Notes — e.g. Journal Image Gallery collapse
+   * flushes twice (separate prop writes) and can fall outside our debounce window.
+   */
+  _onRecordUpdatedForNotes(ev) {
+    if (this._isOtherPluginPathBSettingsRow(ev)) return;
+    this._onWorkspaceDataChanged();
+  }
+
+  _isOtherPluginPathBSettingsRow(ev) {
+    const guid = ev?.recordGuid;
+    if (!guid) return false;
+    let r;
+    try { r = this.data.getRecord?.(guid); } catch (_) { r = null; }
+    if (!r) return false;
+    let pluginId = '';
+    try {
+      pluginId = String(r.text?.('plugin_id') ?? '').trim();
+      if (!pluginId) {
+        const p = r.prop?.('plugin_id');
+        pluginId = String(p?.get?.() ?? p?.text?.() ?? '').trim();
+      }
+    } catch (_) {}
+    if (!pluginId || pluginId === TN_PATHB_PLUGIN_ID) return false;
+    let payload = '';
+    try {
+      payload = String(r.text?.('settings_json') ?? '').trim();
+      if (!payload) {
+        const p = r.prop?.('settings_json');
+        payload = String(p?.text?.() ?? p?.get?.() ?? '').trim();
+      }
+    } catch (_) {}
+    return !!payload;
+  }
+
+  _onWorkspaceDataChanged() {
+    // Coalesce bursts of record.* events (startup sync, Path B, other plugins) so we
+    // do not clear/repaint the footer on every event — that caused visible flashing
+    // and starved other footers mounting into the same container.
+    if (this._workspaceDataDebounceTimer) {
+      try { clearTimeout(this._workspaceDataDebounceTimer); } catch (_) {}
+    }
+    this._workspaceDataDebounceTimer = setTimeout(() => {
+      this._workspaceDataDebounceTimer = null;
+      this._invalidateRecordsCache();
+      this._refreshAll();
+    }, 320);
   }
 
   async _openSettings() {
@@ -555,10 +629,9 @@ class Plugin extends AppPlugin {
     const panelEl   = panel?.getElement?.();
     const container = this._findContainer(panelEl);
 
-    console.log('[TN] _handlePanel', { panelId: panelId?.slice(-6), navType, hasContainer: !!container, hasEl: !!panelEl });
-
     // If container not found, set up a watcher to retry once it appears
     if (!container) {
+      if (!this._isMutationObserveTarget(panelEl)) return;
       let state = this._panelStates.get(panelId);
       if (!state) {
         state = {
@@ -579,7 +652,12 @@ class Plugin extends AppPlugin {
             this._handlePanel(panel); // Retry now that container exists
           }
         });
-        state._containerWatcher.observe(panelEl, { childList: true, subtree: true });
+        try {
+          state._containerWatcher.observe(panelEl, { childList: true, subtree: true });
+        } catch (_) {
+          try { state._containerWatcher.disconnect(); } catch (_) {}
+          state._containerWatcher = null;
+        }
       }
       return;
     }
@@ -587,7 +665,7 @@ class Plugin extends AppPlugin {
     const record = panel?.getActiveRecord?.();
     if (!record)  { this._disposePanel(panelId); return; }
 
-    const journalDate = this._journalDateFromGuid(record.guid);
+    const journalDate = this._journalDayKeyFromRecord(record);
     if (!journalDate) { this._disposePanel(panelId); return; }
 
     let state = this._panelStates.get(panelId);
@@ -616,7 +694,6 @@ class Plugin extends AppPlugin {
     }
 
     const rebuilt = this._mountFooter(state, container, panelEl);
-    console.log('[TN] mounting', { panelId: panelId?.slice(-6), date: journalDate, rebuilt, dateChanged, loaded: state.loaded });
     if (rebuilt) state.loading = false; // Cancel any in-progress populate targeting the old rootEl
     if (dateChanged || !state.loaded || rebuilt) {
       if (state.loading) {
@@ -678,6 +755,7 @@ class Plugin extends AppPlugin {
   }
 
   _createFooterObserver(state, panelEl) {
+    if (!this._isMutationObserveTarget(panelEl)) return null;
     const obs = new MutationObserver(() => {
       if (state.rootEl && !state.rootEl.isConnected) {
         clearTimeout(state._navTimer);
@@ -688,16 +766,25 @@ class Plugin extends AppPlugin {
         }, 300);
       }
     });
-    obs.observe(panelEl, { childList: true, subtree: true });
+    try {
+      obs.observe(panelEl, { childList: true, subtree: true });
+    } catch (_) {
+      try { obs.disconnect(); } catch (_) {}
+      return null;
+    }
     return obs;
+  }
+
+  _isMutationObserveTarget(el) {
+    return !!(el && typeof el === 'object' && typeof Node !== 'undefined' && el instanceof Node);
   }
 
   _findContainer(panelEl) {
     if (!panelEl) return null;
     for (const sel of ['.page-content', '.editor-wrapper', '.editor-panel', '#editor']) {
       if (panelEl.matches?.(sel)) return panelEl;
-      const child = panelEl.querySelector?.(sel);
-      if (child) return child;
+      const all = panelEl.querySelectorAll?.(sel);
+      if (all && all.length) return all[all.length - 1];
     }
     return null;
   }
@@ -809,9 +896,8 @@ class Plugin extends AppPlugin {
   // =========================================================================
 
   async _populate(state) {
-    if (state.loading) { console.log('[TN] _populate blocked (already loading)', state.journalDate); return; }
+    if (state.loading) { return; }
     state.loading = true;
-    console.log('[TN] _populate START', state.journalDate, new Date().toISOString());
 
     // Capture current rootEl and date — used after the async call to detect if we've been superseded
     const targetRootEl = state.rootEl;
@@ -823,14 +909,10 @@ class Plugin extends AppPlugin {
     bodyEl.innerHTML = '<div class="tn-loading">Loading…</div>';
 
     try {
-      console.log('[TN] fetching records for', targetDate);
-      const t0 = performance.now();
       const results = await this._getRecordsForDate(targetDate);
-      console.log('[TN] fetch done', targetDate, `${(performance.now()-t0).toFixed(0)}ms`, results.length, 'results');
 
       // If rootEl was rebuilt or date changed while we awaited, our results are stale — abort
       if (state.rootEl !== targetRootEl || state.journalDate !== targetDate) {
-        console.log('[TN] stale, aborting');
         state.loading = false;
         if (state._pendingPopulate) { state._pendingPopulate = false; this._populate(state); }
         return;
@@ -862,12 +944,6 @@ class Plugin extends AppPlugin {
       }
 
       state.loaded = true;
-      const fRect = state.rootEl.getBoundingClientRect();
-      console.log('[TN] footer rendered', results.length, 'results',
-        `connected:${state.rootEl.isConnected}`,
-        `rect:${Math.round(fRect.width)}x${Math.round(fRect.height)} @${Math.round(fRect.top)},${Math.round(fRect.left)}`,
-        `visible:${fRect.width > 0 && fRect.height > 0}`
-      );
     } catch (e) {
       console.error('[TodaysNotes]', e);
       if (state.rootEl === targetRootEl && targetRootEl.isConnected) {
@@ -1180,6 +1256,14 @@ class Plugin extends AppPlugin {
   // =========================================================================
 
   async _getRecordsForDate(yyyymmdd) {
+    const sig = this._settingsCacheSignature();
+    const cacheKey = `${yyyymmdd}::${sig}`;
+    const now = Date.now();
+    const hit = this._recordsByDateCache?.get?.(cacheKey);
+    if (hit && (now - hit.ts) < TN_QUERY_CACHE_TTL_MS && Array.isArray(hit.results)) {
+      return hit.results;
+    }
+
     const y = parseInt(yyyymmdd.slice(0,4), 10);
     const m = parseInt(yyyymmdd.slice(4,6), 10) - 1;
     const d = parseInt(yyyymmdd.slice(6,8), 10);
@@ -1219,6 +1303,7 @@ class Plugin extends AppPlugin {
       return c !== 0 ? c : a.dateVal - b.dateVal;
     });
 
+    try { this._recordsByDateCache.set(cacheKey, { ts: now, results }); } catch (_) {}
     return results;
   }
 
@@ -1245,17 +1330,19 @@ class Plugin extends AppPlugin {
   // Utilities
   // =========================================================================
 
-  _journalDateFromGuid(guid) {
-    if (!guid || guid.length < 8) return null;
-    const suffix = guid.slice(-8);
-    if (!/^\d{8}$/.test(suffix)) return null;
-    const year  = parseInt(suffix.slice(0,4), 10);
-    const month = parseInt(suffix.slice(4,6), 10);
-    const day   = parseInt(suffix.slice(6,8), 10);
-    if (year < 2000 || year > 2099) return null;
-    if (month < 1 || month > 12)    return null;
-    if (day < 1   || day > 31)      return null;
-    return suffix;
+  /** YYYYMMDD for real journal pages only — do not infer from record GUID (false positives on normal notes). */
+  _journalDayKeyFromRecord(record) {
+    if (!record) return null;
+    try {
+      const date = record.getJournalDetails?.()?.date;
+      if (date instanceof Date && !isNaN(date.getTime())) {
+        const y = String(date.getFullYear());
+        const m = String(date.getMonth() + 1).padStart(2, '0');
+        const d = String(date.getDate()).padStart(2, '0');
+        return `${y}${m}${d}`;
+      }
+    } catch (_) {}
+    return null;
   }
 
   _loadBool(key, def) {
@@ -1281,6 +1368,8 @@ class Plugin extends AppPlugin {
   }
 
   _injectCSS() {
+    /* Scope every rule under .tn-footer. Shared tlr-* class names match Thymer's journal
+       line UI; global rules were leaking into the editor (wrong bullets / layout). */
     this.ui.injectCSS(`
       .tn-footer {
         margin-top: 16px;
@@ -1291,14 +1380,14 @@ class Plugin extends AppPlugin {
         border-radius: 10px;
         padding: 12px 16px 10px;
       }
-      .tn-header {
+      .tn-footer .tn-header {
         display: flex;
         align-items: center;
         gap: 8px;
         min-height: 30px;
         margin-bottom: 8px;
       }
-      .tn-toggle {
+      .tn-footer .tn-toggle {
         font-size: 13px;
         line-height: 1;
         color: #8a7e6a;
@@ -1307,26 +1396,26 @@ class Plugin extends AppPlugin {
         min-width: 18px;
         flex-shrink: 0;
       }
-      .tn-title-icon {
+      .tn-footer .tn-title-icon {
         color: #8a7e6a;
         font-size: 14px;
         flex-shrink: 0;
         display: inline-flex;
         align-items: center;
       }
-      .tn-title {
+      .tn-footer .tn-title {
         font-weight: 600;
         font-size: 13px;
         white-space: nowrap;
         flex: 1;
       }
-      .tn-count {
+      .tn-footer .tn-count {
         color: #8a7e6a;
         font-size: 12px;
         white-space: nowrap;
         font-variant-numeric: tabular-nums;
       }
-      .tn-settings-btn {
+      .tn-footer .tn-settings-btn {
         font-size: 13px;
         color: #8a7e6a;
         cursor: pointer;
@@ -1335,15 +1424,15 @@ class Plugin extends AppPlugin {
         transition: opacity 0.15s;
       }
       .tn-footer:hover .tn-settings-btn { opacity: 1; }
-      .tn-settings-btn:hover { color: #e8e0d0; }
-      .tn-body { padding-bottom: 4px; }
-      .tn-loading, .tn-empty {
+      .tn-footer .tn-settings-btn:hover { color: #e8e0d0; }
+      .tn-footer .tn-body { padding-bottom: 4px; }
+      .tn-footer .tn-loading, .tn-footer .tn-empty {
         font-size: 12px;
         color: #8a7e6a;
         padding: 4px 0 6px;
         font-style: italic;
       }
-      .tn-coll-label {
+      .tn-footer .tn-coll-label {
         font-size: 10px;
         font-weight: 700;
         letter-spacing: 0.07em;
@@ -1351,12 +1440,12 @@ class Plugin extends AppPlugin {
         color: #8a7e6a;
         padding: 8px 0 3px;
       }
-      .tn-record-group {
+      .tn-footer .tn-record-group {
         margin: 0 -6px;
         border-radius: 6px;
         margin-bottom: 2px;
       }
-      .tn-row {
+      .tn-footer .tn-row {
         display: flex;
         align-items: center;
         gap: 4px;
@@ -1364,9 +1453,9 @@ class Plugin extends AppPlugin {
         border-radius: 6px;
         transition: background 0.1s;
       }
-      .tn-record-group:not(.tlr-record-expanded) .tn-row:hover { background: rgba(255,255,255,0.05); }
-      .tn-record-group.tlr-record-expanded .tn-row { background: rgba(255,255,255,0.04); border-radius: 6px 6px 0 0; }
-      .tn-record-name {
+      .tn-footer .tn-record-group:not(.tlr-record-expanded) .tn-row:hover { background: rgba(255,255,255,0.05); }
+      .tn-footer .tn-record-group.tlr-record-expanded .tn-row { background: rgba(255,255,255,0.04); border-radius: 6px 6px 0 0; }
+      .tn-footer .tn-record-name {
         flex: 1;
         min-width: 0;
         text-align: left;
@@ -1378,8 +1467,8 @@ class Plugin extends AppPlugin {
         cursor: pointer;
         padding: 0;
       }
-      .tn-record-name:hover { color: #fff; }
-      .tn-arrow {
+      .tn-footer .tn-record-name:hover { color: #fff; }
+      .tn-footer .tn-arrow {
         opacity: 0;
         color: #8a7e6a;
         flex-shrink: 0;
@@ -1388,11 +1477,10 @@ class Plugin extends AppPlugin {
         padding: 0;
         transition: opacity 0.1s;
       }
-      .tn-row:hover .tn-arrow { opacity: 1; }
-      .tn-arrow:hover { color: #e8e0d0; }
+      .tn-footer .tn-row:hover .tn-arrow { opacity: 1; }
+      .tn-footer .tn-arrow:hover { color: #e8e0d0; }
 
-      /* Expand button */
-      .tlr-expand-record-btn {
+      .tn-footer .tlr-expand-record-btn {
         display: inline-flex;
         align-items: center;
         justify-content: center;
@@ -1412,11 +1500,10 @@ class Plugin extends AppPlugin {
         vertical-align: middle;
         flex-shrink: 0;
       }
-      .tlr-expand-record-btn:hover { color: #e8e0d0; }
-      .tlr-expand-record-btn.is-expanded { color: var(--color-primary-400,#c4b5fd); }
+      .tn-footer .tlr-expand-record-btn:hover { color: #e8e0d0; }
+      .tn-footer .tlr-expand-record-btn.is-expanded { color: var(--color-primary-400,#c4b5fd); }
 
-      /* Preview container — closer to main record typography */
-      .tlr-record-preview {
+      .tn-footer .tlr-record-preview {
         display: none;
         flex-direction: column;
         margin: 0 0 6px 10px;
@@ -1429,26 +1516,25 @@ class Plugin extends AppPlugin {
         line-height: 1.45;
         color: var(--color-text-100, #e8e0d0);
       }
-      .tlr-record-expanded .tlr-record-preview { display: flex; }
-      .tlr-expand-loading, .tlr-expand-empty {
+      .tn-footer .tlr-record-expanded .tlr-record-preview { display: flex; }
+      .tn-footer .tlr-expand-loading, .tn-footer .tlr-expand-empty {
         font-style: italic;
         color: #8a7e6a;
         font-size: 12px;
         padding: 4px 0;
       }
 
-      /* Preview tree — indent only the children container, not the node itself */
-      .tlr-preview-node {
+      .tn-footer .tlr-preview-node {
         display: flex;
         flex-direction: column;
       }
-      .tlr-preview-row {
+      .tn-footer .tlr-preview-row {
         display: flex;
         align-items: center;
         gap: 2px;
         padding-left: calc(var(--tlr-depth, 0) * 16px);
       }
-      .tlr-preview-toggle {
+      .tn-footer .tlr-preview-toggle {
         width: 14px;
         min-width: 14px;
         height: 16px;
@@ -1463,11 +1549,11 @@ class Plugin extends AppPlugin {
         font-size: 8px;
         transition: color 0.1s;
       }
-      .tlr-preview-toggle:hover { color: #e8e0d0; }
-      .tlr-preview-spacer { width: 14px; min-width: 14px; flex-shrink: 0; display: inline-block; }
-      .tlr-preview-children { display: flex; flex-direction: column; }
-      .tlr-preview-children.is-hidden { display: none; }
-      .tlr-expand-line {
+      .tn-footer .tlr-preview-toggle:hover { color: #e8e0d0; }
+      .tn-footer .tlr-preview-spacer { width: 14px; min-width: 14px; flex-shrink: 0; display: inline-block; }
+      .tn-footer .tlr-preview-children { display: flex; flex-direction: column; }
+      .tn-footer .tlr-preview-children.is-hidden { display: none; }
+      .tn-footer .tlr-expand-line {
         flex: 1;
         min-width: 0;
         text-align: left;
@@ -1479,15 +1565,15 @@ class Plugin extends AppPlugin {
         word-break: break-word;
         cursor: pointer;
       }
-      .tlr-expand-line:hover { background: rgba(255,255,255,0.05); color: #e8e0d0; }
+      .tn-footer .tlr-expand-line:hover { background: rgba(255,255,255,0.05); color: #e8e0d0; }
 
-      .tn-prefix { color: #8a7e6a; font-size: 11px; flex-shrink: 0; margin-right: 2px; }
-      .tn-line-content strong { color: #e8e0d0; }
-      .tn-line-content em { opacity: 0.8; }
-      .tn-line-content code { font-family: monospace; font-size: 11px; background: rgba(255,255,255,0.06); padding: 0 3px; border-radius: 3px; }
-      .tn-seg-ref  { color: var(--color-primary-400,#c4b5fd); }
-      .tn-seg-link { color: var(--color-primary-400,#c4b5fd); text-decoration: none; }
-      .tn-seg-link:hover { text-decoration: underline; }
+      .tn-footer .tn-prefix { color: #8a7e6a; font-size: 11px; flex-shrink: 0; margin-right: 2px; }
+      .tn-footer .tn-line-content strong { color: #e8e0d0; }
+      .tn-footer .tn-line-content em { opacity: 0.8; }
+      .tn-footer .tn-line-content code { font-family: monospace; font-size: 11px; background: rgba(255,255,255,0.06); padding: 0 3px; border-radius: 3px; }
+      .tn-footer .tn-seg-ref  { color: var(--color-primary-400,#c4b5fd); }
+      .tn-footer .tn-seg-link { color: var(--color-primary-400,#c4b5fd); text-decoration: none; }
+      .tn-footer .tn-seg-link:hover { text-decoration: underline; }
     `);
   }
 }
