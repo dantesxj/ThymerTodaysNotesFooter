@@ -28,8 +28,8 @@ Includes Path B support (`Plugin Settings` collection + localStorage mirror):
 
 ## Files
 
-- `Today's Notes.js` - plugin code
-- `Today's Notes.json` - collection/plugin metadata
+- `plugin.js` - plugin code
+- `plugin.json` - collection/plugin metadata
 
 ## Known limitations
 
