@@ -330,11 +330,14 @@
   SETTINGS: localStorage "tn_settings_v1" (+ tn_footer_collapsed), or synced via Plugin Settings (path B — see PLUGIN_SETTINGS_PERSISTENCE.md)
   {
     dateFields: ["When", "when"],      // property names to check for date matching
-    excludedCollections: ["Archives"]  // collection names to hide
+    excludedCollections: ["Archives"], // collection names to hide
+    panelLabel: "", // empty = default "Today's Notes"
+    timeMachine: { enabled: true, filters: [{ field: "When", op: "same_day_last_year", value: "" }] }
   }
 */
 
 const TN_SETTINGS_KEY = 'tn_settings_v1';
+const TN_TM_SECTION_KEY = '__timemachine__';
 const TN_PATHB_PLUGIN_ID = 'todays-notes';
 const TN_QUERY_CACHE_TTL_MS = 45000;
 
@@ -433,18 +436,42 @@ class Plugin extends AppPlugin {
   // Settings
   // =========================================================================
 
+  _defaultTimeMachine() {
+    return {
+      enabled: true,
+      filters: [{ id: 'tm_default', field: 'When', op: 'same_day_last_year', value: '' }],
+    };
+  }
+
+  _normalizeTimeMachine(tm) {
+    const base = this._defaultTimeMachine();
+    if (!tm || typeof tm !== 'object') return base;
+    const enabled = tm.enabled !== false;
+    const filters = Array.isArray(tm.filters) && tm.filters.length
+      ? tm.filters.map((f, i) => ({
+        id: String(f?.id || `tm_${i}`),
+        field: String(f?.field || 'When').trim(),
+        op: String(f?.op || 'same_day_last_year').trim(),
+        value: f?.value != null ? String(f.value) : '',
+      }))
+      : base.filters;
+    return { enabled, filters };
+  }
+
   _loadSettings() {
     try {
       const raw = localStorage.getItem(TN_SETTINGS_KEY);
       if (raw) {
         const parsed = JSON.parse(raw);
         return {
+          panelLabel:          typeof parsed.panelLabel === 'string' ? parsed.panelLabel : '',
           dateFields:          Array.isArray(parsed.dateFields)          ? parsed.dateFields          : ['When', 'when'],
           excludedCollections: Array.isArray(parsed.excludedCollections) ? parsed.excludedCollections : [],
+          timeMachine:         this._normalizeTimeMachine(parsed.timeMachine),
         };
       }
     } catch (_) {}
-    return { dateFields: ['When', 'when'], excludedCollections: [] };
+    return { panelLabel: '', dateFields: ['When', 'when'], excludedCollections: [], timeMachine: this._defaultTimeMachine() };
   }
 
   _saveSettings() {
@@ -454,11 +481,26 @@ class Plugin extends AppPlugin {
   }
 
   _settingsCacheSignature() {
+    const pl = String(this._settings?.panelLabel || '').trim().toLowerCase();
     const fields = Array.isArray(this._settings?.dateFields) ? this._settings.dateFields : [];
     const excluded = Array.isArray(this._settings?.excludedCollections) ? this._settings.excludedCollections : [];
     const f = fields.map((x) => String(x || '').trim().toLowerCase()).filter(Boolean).sort();
     const e = excluded.map((x) => String(x || '').trim().toLowerCase()).filter(Boolean).sort();
-    return JSON.stringify({ f, e });
+    const tm = this._normalizeTimeMachine(this._settings?.timeMachine);
+    return JSON.stringify({ pl, f, e, tm });
+  }
+
+  _panelTitleText() {
+    const p = String(this._settings?.panelLabel || '').trim();
+    return p || "Today's Notes";
+  }
+
+  _syncFooterTitles() {
+    const t = this._panelTitleText();
+    for (const [, s] of this._panelStates || new Map()) {
+      const el = s.rootEl?.querySelector?.('.tn-title');
+      if (el) el.textContent = t;
+    }
   }
 
   _invalidateRecordsCache() {
@@ -532,10 +574,11 @@ class Plugin extends AppPlugin {
       .filter(n => n && !journalNames.has(n.toLowerCase()))
       .sort();
 
-    // Working copy of settings
     const s = {
+      panelLabel:          this._settings.panelLabel != null ? String(this._settings.panelLabel) : '',
       dateFields:          [...this._settings.dateFields],
       excludedCollections: new Set(this._settings.excludedCollections),
+      timeMachine:         JSON.parse(JSON.stringify(this._normalizeTimeMachine(this._settings.timeMachine))),
     };
 
     const render = () => {
@@ -543,6 +586,19 @@ class Plugin extends AppPlugin {
       el.style.cssText = 'padding:0;overflow:auto;height:100%;box-sizing:border-box;';
       const wrap = document.createElement('div');
       wrap.style.cssText = 'padding:24px;max-width:560px;margin:0 auto;display:flex;flex-direction:column;gap:20px;';
+
+      // ── Panel title ─────────────────────────────────────────────────────
+      const titleSec = document.createElement('div');
+      titleSec.appendChild(this._cfgLabel('Footer title',
+        'Label shown in the journal footer (leave blank for the default).'));
+      const plInp = document.createElement('input');
+      plInp.type = 'text';
+      plInp.placeholder = "Today's Notes";
+      plInp.value = s.panelLabel;
+      plInp.style.cssText = 'width:100%;padding:7px 10px;border-radius:6px;font-size:13px;background:var(--bg-default,#18181b);color:inherit;border:1px solid var(--border-default,#3f3f46);outline:none;box-sizing:border-box;';
+      plInp.addEventListener('input', () => { s.panelLabel = plInp.value; });
+      titleSec.appendChild(plInp);
+      wrap.appendChild(titleSec);
 
       // ── Date fields ────────────────────────────────────────────────────
       const dfSec = document.createElement('div');
@@ -595,16 +651,107 @@ class Plugin extends AppPlugin {
       });
       wrap.appendChild(collSec);
 
+      // ── Time Machine ───────────────────────────────────────────────────
+      const tmSec = document.createElement('div');
+      tmSec.appendChild(this._cfgLabel('Time Machine',
+        'Optional section at the bottom of the footer. Filters use the journal page date as context.'));
+
+      const tmEn = document.createElement('label');
+      tmEn.style.cssText = 'display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px;margin-bottom:10px;';
+      const tmCb = document.createElement('input');
+      tmCb.type = 'checkbox';
+      tmCb.checked = s.timeMachine.enabled !== false;
+      tmCb.addEventListener('change', () => { s.timeMachine.enabled = tmCb.checked; });
+      const tmLb = document.createElement('span');
+      tmLb.textContent = 'Show Time Machine section';
+      tmEn.appendChild(tmCb);
+      tmEn.appendChild(tmLb);
+      tmSec.appendChild(tmEn);
+
+      s.timeMachine.filters = Array.isArray(s.timeMachine.filters) ? s.timeMachine.filters : [];
+      const tmFiltersWrap = document.createElement('div');
+      tmFiltersWrap.style.cssText = 'display:flex;flex-direction:column;gap:8px;border-top:1px solid rgba(255,255,255,0.08);padding-top:10px;';
+
+      const opChoices = [
+        ['same_day_last_year', 'Same calendar day, last year'],
+        ['on_journal_day', 'On journal day'],
+        ['same_month_day_as_journal', 'Same month/day as journal (any year)'],
+        ['not_on_journal_day', 'Not on journal day'],
+        ['eq', 'Text equals'],
+        ['neq', 'Text not equals'],
+        ['contains', 'Text contains'],
+        ['not_contains', 'Text does not contain'],
+        ['starts_with', 'Text starts with'],
+        ['ends_with', 'Text ends with'],
+        ['is_empty', 'Field empty'],
+        ['is_not_empty', 'Field not empty'],
+      ];
+
+      const renderTmFilters = () => {
+        tmFiltersWrap.innerHTML = '';
+        s.timeMachine.filters.forEach((rule, ridx) => {
+          const row = document.createElement('div');
+          row.style.cssText = 'display:flex;flex-wrap:wrap;gap:8px;align-items:center;';
+          const fin = document.createElement('input');
+          fin.type = 'text';
+          fin.placeholder = 'Field name (e.g. When)';
+          fin.value = rule.field || '';
+          fin.style.cssText = 'flex:1;min-width:100px;padding:6px 8px;border-radius:6px;font-size:12px;background:var(--bg-default,#18181b);color:inherit;border:1px solid var(--border-default,#3f3f46);';
+          fin.addEventListener('input', () => { s.timeMachine.filters[ridx].field = fin.value.trim(); });
+          const opSel = document.createElement('select');
+          opSel.style.cssText = 'padding:6px 8px;border-radius:6px;font-size:12px;background:var(--bg-default,#18181b);color:inherit;border:1px solid var(--border-default,#3f3f46);';
+          for (const [val, lab] of opChoices) {
+            const o = document.createElement('option');
+            o.value = val;
+            o.textContent = lab;
+            opSel.appendChild(o);
+          }
+          opSel.value = opChoices.some(([v]) => v === rule.op) ? rule.op : 'same_day_last_year';
+          opSel.addEventListener('change', () => { s.timeMachine.filters[ridx].op = opSel.value; });
+          const vin = document.createElement('input');
+          vin.type = 'text';
+          vin.placeholder = 'Compare value (text ops)';
+          vin.value = rule.value || '';
+          vin.style.cssText = 'flex:1;min-width:80px;padding:6px 8px;border-radius:6px;font-size:12px;background:var(--bg-default,#18181b);color:inherit;border:1px solid var(--border-default,#3f3f46);';
+          vin.addEventListener('input', () => { s.timeMachine.filters[ridx].value = vin.value; });
+          const rm = document.createElement('button');
+          rm.type = 'button';
+          rm.textContent = '✕';
+          rm.style.cssText = 'background:none;border:none;color:var(--text-muted,#888);cursor:pointer;font-size:12px;padding:4px;';
+          rm.addEventListener('click', () => { s.timeMachine.filters.splice(ridx, 1); renderTmFilters(); });
+          row.appendChild(fin);
+          row.appendChild(opSel);
+          row.appendChild(vin);
+          row.appendChild(rm);
+          tmFiltersWrap.appendChild(row);
+        });
+      };
+      renderTmFilters();
+      const addTmFilter = document.createElement('button');
+      addTmFilter.type = 'button';
+      addTmFilter.textContent = '+ Add filter rule';
+      addTmFilter.style.cssText = 'margin-top:6px;padding:6px 12px;background:transparent;border:1px dashed var(--border-default,#3f3f46);border-radius:6px;font-size:12px;color:var(--text-muted,#888);cursor:pointer;';
+      addTmFilter.addEventListener('click', () => {
+        s.timeMachine.filters.push({ id: `tm_${Date.now()}`, field: 'When', op: 'same_day_last_year', value: '' });
+        renderTmFilters();
+      });
+      tmSec.appendChild(tmFiltersWrap);
+      tmSec.appendChild(addTmFilter);
+      wrap.appendChild(tmSec);
+
       // ── Save ──────────────────────────────────────────────────────────
       const saveBtn = document.createElement('button');
       saveBtn.textContent = 'Save Settings';
       saveBtn.style.cssText = 'padding:10px 0;background:var(--color-primary-500,#a78bfa);color:#fff;border:none;border-radius:8px;font-weight:700;font-size:14px;cursor:pointer;width:100%;';
       saveBtn.addEventListener('click', () => {
         this._settings = {
+          panelLabel:          String(s.panelLabel || '').trim(),
           dateFields:          s.dateFields.filter(f => f.trim()),
           excludedCollections: Array.from(s.excludedCollections),
+          timeMachine:         this._normalizeTimeMachine(s.timeMachine),
         };
         this._saveSettings();
+        this._syncFooterTitles();
         this._refreshAll();
         this.ui.addToaster({ title: 'Saved', message: "Today's Notes settings saved.", dismissible: true, autoDestroyTime: 3000 });
       });
@@ -640,6 +787,11 @@ class Plugin extends AppPlugin {
           loading: false, loaded: false,
           recordExpandedState: new Map(),
           _containerWatcher: null,
+          _sectionCollapsed: {},
+          _lastMainResults: [],
+          _lastCollectionIcons: {},
+          timeMachineResults: null,
+          timeMachineLoading: false,
         };
         this._panelStates.set(panelId, state);
 
@@ -677,6 +829,11 @@ class Plugin extends AppPlugin {
         rootEl: null, observer: null,
         loading: false, loaded: false,
         recordExpandedState: new Map(),
+        _sectionCollapsed: state?._sectionCollapsed || {},
+        _lastMainResults: [],
+        _lastCollectionIcons: {},
+        timeMachineResults: null,
+        timeMachineLoading: false,
       };
       this._panelStates.set(panelId, state);
     } else {
@@ -686,10 +843,16 @@ class Plugin extends AppPlugin {
 
       state.journalDate = journalDate;
       state.panel       = panel;
+      state._sectionCollapsed = state._sectionCollapsed || {};
+      if (state.timeMachineResults === undefined) state.timeMachineResults = null;
+      if (state.timeMachineLoading === undefined) state.timeMachineLoading = false;
       // Reset state when date changes
       if (dateChanged) {
         state.loaded = false;
         state.recordExpandedState = new Map();
+        state._sectionCollapsed = {};
+        state.timeMachineResults = null;
+        state.timeMachineLoading = false;
       }
     }
 
@@ -789,6 +952,580 @@ class Plugin extends AppPlugin {
     return null;
   }
 
+  _timeMachineEnabled() {
+    const tm = this._normalizeTimeMachine(this._settings?.timeMachine);
+    return !!tm.enabled && Array.isArray(tm.filters) && tm.filters.length > 0;
+  }
+
+  _collectionSectionKey(name) {
+    return `coll:${String(name || '').trim().toLowerCase()}`;
+  }
+
+  _allInnerTnSectionsCollapsed(state) {
+    if (!state) return false;
+    const byColl = this._groupResultsByCollection(state._lastMainResults || []);
+    for (const name of byColl.keys()) {
+      const sk = this._collectionSectionKey(name);
+      if (!(sk in state._sectionCollapsed)) state._sectionCollapsed[sk] = false;
+      if (!state._sectionCollapsed[sk]) return false;
+    }
+    if (this._timeMachineEnabled()) {
+      if (!(TN_TM_SECTION_KEY in state._sectionCollapsed)) state._sectionCollapsed[TN_TM_SECTION_KEY] = false;
+      if (!state._sectionCollapsed[TN_TM_SECTION_KEY]) return false;
+    }
+    return byColl.size > 0 || this._timeMachineEnabled();
+  }
+
+  _expandAllTnSections(state) {
+    if (!state) return;
+    const byColl = this._groupResultsByCollection(state._lastMainResults || []);
+    for (const name of byColl.keys()) {
+      state._sectionCollapsed[this._collectionSectionKey(name)] = false;
+    }
+    if (this._timeMachineEnabled()) state._sectionCollapsed[TN_TM_SECTION_KEY] = false;
+  }
+
+  _syncTnHeaderExtras(state) {
+    const root = state?.rootEl;
+    if (!root) return;
+    const tmBtn = root.querySelector('.tn-tm-header-btn');
+    if (tmBtn) {
+      if (!this._timeMachineEnabled()) {
+        tmBtn.style.display = 'none';
+      } else {
+        const tmCollapsed = !!state._sectionCollapsed?.[TN_TM_SECTION_KEY];
+        tmBtn.style.display = tmCollapsed && !this._collapsed ? '' : 'none';
+        tmBtn.title = 'Expand Time Machine section';
+      }
+    }
+    const wrap = root.querySelector('.tn-collapsed-sections-wrap');
+    if (!wrap) return;
+    wrap.innerHTML = '';
+    if (this._collapsed) return;
+    const byColl = this._groupResultsByCollection(state._lastMainResults || []);
+    for (const collName of byColl.keys()) {
+      const sk = this._collectionSectionKey(collName);
+      if (!state._sectionCollapsed?.[sk]) continue;
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'tn-collapsed-chip button-none button-small button-minimal-hover';
+      btn.title = `Expand ${collName}`;
+      btn.dataset.tnExpandSection = sk;
+      const iconWrap = document.createElement('span');
+      iconWrap.className = 'tn-collapsed-chip-icon';
+      const rawIcon = (state._lastCollectionIcons && state._lastCollectionIcons[collName]) || '';
+      if (!this._appendCollectionIconVisual(iconWrap, rawIcon)) {
+        try { iconWrap.appendChild(this.ui.createIcon('ti-folder')); } catch (_) { iconWrap.textContent = '📁'; }
+      }
+      btn.appendChild(iconWrap);
+      btn.addEventListener('click', (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        state._sectionCollapsed[sk] = false;
+        if (this._collapsed) {
+          this._collapsed = false;
+          this._saveBool('tn_footer_collapsed', this._collapsed);
+          const body = root.querySelector('[data-role="body"]');
+          const tgl = root.querySelector('.tn-toggle');
+          if (body) body.style.display = 'block';
+          if (tgl) tgl.textContent = '−';
+        }
+        this._renderFooterBody(state);
+        this._syncTnHeaderExtras(state);
+      });
+      wrap.appendChild(btn);
+    }
+
+    // Time Machine when collapsed uses `.tn-tm-header-btn` only (avoid duplicate header icons).
+  }
+
+  _groupResultsByCollection(results) {
+    const m = new Map();
+    for (const item of results || []) {
+      const n = item.collectionName || '';
+      if (!m.has(n)) m.set(n, []);
+      m.get(n).push(item);
+    }
+    return m;
+  }
+
+  _createIconNode(iconNames) {
+    const list = Array.isArray(iconNames) ? iconNames : [iconNames];
+    for (const name of list) {
+      const key = String(name || '').trim();
+      if (!key) continue;
+      try {
+        const node = this.ui.createIcon?.(key);
+        if (node) return node;
+      } catch (_) {}
+    }
+    return null;
+  }
+
+  _appendCollectionIconVisual(parent, rawIcon) {
+    if (!parent) return false;
+    const s = String(rawIcon || '').trim();
+    if (!s) return false;
+    if (/[^\x00-\x7F]/.test(s) && !/^ti[-\s]/i.test(s)) {
+      const span = document.createElement('span');
+      span.className = 'tn-collection-icon-emoji';
+      span.textContent = s;
+      span.setAttribute('aria-hidden', 'true');
+      parent.appendChild(span);
+      return true;
+    }
+    const candidates = [];
+    if (s.startsWith('ti-')) {
+      candidates.push(s, s.slice(3));
+    } else {
+      candidates.push(`ti-${s.replace(/^ti-?/i, '')}`, s);
+    }
+    for (const c of candidates) {
+      const node = this._createIconNode([c]);
+      if (node) {
+        parent.appendChild(node);
+        return true;
+      }
+    }
+    const slug = (s.startsWith('ti-') ? s.slice(3) : s.replace(/^ti-?/i, '')).replace(/_/g, '-').replace(/\s+/g, '-');
+    if (/^[a-z0-9-]+$/i.test(slug)) {
+      const i = document.createElement('i');
+      i.className = `ti ti-${slug.toLowerCase()}`;
+      i.setAttribute('aria-hidden', 'true');
+      parent.appendChild(i);
+      return true;
+    }
+    return false;
+  }
+
+  _collectionIconName(coll) {
+    if (!coll) return '';
+    const candidates = [];
+    const push = (v) => {
+      if (v == null || typeof v === 'object') return;
+      const t = String(v).trim();
+      if (t) candidates.push(t);
+    };
+    try {
+      const cfg = coll.getConfiguration?.() || {};
+      push(cfg.icon);
+      push(cfg.collection_icon);
+      push(cfg.iconName);
+      push(cfg.emoji);
+    } catch (_) {}
+    try {
+      const data = coll?.getData?.() || {};
+      push(data.icon);
+      push(data.emoji);
+    } catch (_) {}
+    push(coll?.icon);
+    try { push(coll.getIcon?.()); } catch (_) {}
+    for (const raw of candidates) {
+      if (/^ti-photo$/i.test(raw)) continue;
+      if (raw.startsWith('ti-')) return raw;
+      if (/^[a-z0-9_-]+$/i.test(raw)) return `ti-${raw.replace(/^ti-?/, '').replace(/_/g, '-')}`;
+      if (/[^\x00-\x7F]/.test(raw)) return raw;
+    }
+    return '';
+  }
+
+  _appendTmGenerateIcon(btn, size = 18) {
+    if (!btn) return;
+    btn.innerHTML = '';
+    const n = Math.max(12, Math.min(32, Number(size) || 18));
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+    svg.setAttribute('width', String(n));
+    svg.setAttribute('height', String(n));
+    svg.setAttribute('viewBox', '0 0 24 24');
+    svg.setAttribute('fill', 'none');
+    svg.setAttribute('stroke', 'currentColor');
+    svg.setAttribute('stroke-width', n <= 18 ? '1.75' : '1.65');
+    svg.setAttribute('aria-hidden', 'true');
+    const p = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    p.setAttribute('stroke-linecap', 'round');
+    p.setAttribute('stroke-linejoin', 'round');
+    p.setAttribute('d', 'M12 8v4l3 2M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0z');
+    svg.appendChild(p);
+    btn.appendChild(svg);
+  }
+
+  _journalDateParts(yyyymmdd) {
+    const y = parseInt(String(yyyymmdd || '').slice(0, 4), 10);
+    const m = parseInt(String(yyyymmdd || '').slice(4, 6), 10);
+    const d = parseInt(String(yyyymmdd || '').slice(6, 8), 10);
+    return { year: y, month: m, day: d, yyyymmdd: String(yyyymmdd || '') };
+  }
+
+  _dayRangeFromKey(yyyymmdd) {
+    const p = this._journalDateParts(yyyymmdd);
+    const start = new Date(p.year, p.month - 1, p.day, 0, 0, 0, 0);
+    const end = new Date(p.year, p.month - 1, p.day, 23, 59, 59, 999);
+    return { start, end };
+  }
+
+  _dayRangeSameDayLastYear(yyyymmdd) {
+    const p = this._journalDateParts(yyyymmdd);
+    const start = new Date(p.year, p.month - 1, p.day, 0, 0, 0, 0);
+    start.setFullYear(start.getFullYear() - 1);
+    const end = new Date(p.year, p.month - 1, p.day, 23, 59, 59, 999);
+    end.setFullYear(end.getFullYear() - 1);
+    return { start, end };
+  }
+
+  _coerceDateForTm(raw) {
+    if (!raw) return null;
+    if (raw instanceof Date && !Number.isNaN(raw.getTime())) return raw;
+    if (typeof raw?.toDate === 'function') {
+      const d = raw.toDate();
+      if (d instanceof Date && !Number.isNaN(d.getTime())) return d;
+    }
+    if (typeof raw?.value === 'function') {
+      const d = new Date(raw.value());
+      if (!Number.isNaN(d.getTime())) return d;
+    }
+    if (typeof raw === 'number') {
+      const d = new Date(raw);
+      if (!Number.isNaN(d.getTime())) return d;
+    }
+    if (typeof raw === 'string' && raw.length >= 8) {
+      const d = new Date(raw);
+      if (!Number.isNaN(d.getTime())) return d;
+    }
+    return null;
+  }
+
+  _readDateFieldNamed(record, fieldName) {
+    const key = String(fieldName || '').trim();
+    if (!key) return null;
+    try {
+      const prop = record.prop(key);
+      if (!prop) return null;
+      if (typeof prop.date === 'function') {
+        const d = prop.date();
+        if (d instanceof Date && !Number.isNaN(d.getTime())) return d;
+      }
+      return this._coerceDateForTm(prop.get?.());
+    } catch (_) {}
+    return null;
+  }
+
+  _readFieldValueSimple(record, fieldName) {
+    const key = String(fieldName || '').trim();
+    if (!key) return '';
+    try {
+      const prop = record.prop(key);
+      if (!prop) return '';
+      const raw = prop.get?.();
+      if (raw == null) return '';
+      if (typeof raw === 'string') return raw;
+      if (typeof raw === 'number' || typeof raw === 'boolean') return String(raw);
+      if (raw instanceof Date) return `${raw.getFullYear()}-${String(raw.getMonth() + 1).padStart(2, '0')}-${String(raw.getDate()).padStart(2, '0')}`;
+      if (typeof raw?.label === 'string') return raw.label;
+      if (typeof raw?.name === 'string') return raw.name;
+      return String(raw);
+    } catch (_) {
+      return '';
+    }
+  }
+
+  _recordPassesTmFilters(record, journalYyyymmdd) {
+    const tm = this._normalizeTimeMachine(this._settings?.timeMachine);
+    const filters = tm.filters || [];
+    const journalParts = this._journalDateParts(journalYyyymmdd);
+    const dayRange = this._dayRangeFromKey(journalYyyymmdd);
+    const lastYearRange = this._dayRangeSameDayLastYear(journalYyyymmdd);
+    for (const rule of filters) {
+      if (!this._evaluateTmFilterRule(record, rule, journalParts, dayRange, lastYearRange)) return false;
+    }
+    return true;
+  }
+
+  _evaluateTmFilterRule(record, rule, journalParts, dayRange, lastYearRange) {
+    const field = String(rule?.field || '').trim();
+    const op = String(rule?.op || '').trim();
+    const cmpRaw = String(rule?.value || '');
+    if (!field && op !== 'always') return true;
+
+    const isDateOp = ['on_journal_day', 'not_on_journal_day', 'same_month_day_as_journal', 'same_day_last_year'].includes(op);
+    const raw = isDateOp ? this._readDateFieldNamed(record, field) : this._readFieldValueSimple(record, field);
+    const value = (v) => {
+      if (v == null) return '';
+      if (v instanceof Date) return `${v.getFullYear()}-${String(v.getMonth() + 1).padStart(2, '0')}-${String(v.getDate()).padStart(2, '0')}`;
+      return String(v).toLowerCase();
+    };
+    const cmp = String(cmpRaw || '').toLowerCase();
+
+    if (op === 'is_empty') {
+      if (isDateOp) return !this._coerceDateForTm(raw);
+      const vs = this._readFieldValueSimple(record, field);
+      return !vs || !String(vs).trim();
+    }
+    if (op === 'is_not_empty') {
+      if (isDateOp) return !!this._coerceDateForTm(raw);
+      const vs = this._readFieldValueSimple(record, field);
+      return !!vs && !!String(vs).trim();
+    }
+
+    if (op === 'same_month_day_as_journal') {
+      const d = this._coerceDateForTm(raw);
+      if (!d) return false;
+      return d.getMonth() + 1 === journalParts.month && d.getDate() === journalParts.day;
+    }
+    if (op === 'on_journal_day') {
+      const d = this._coerceDateForTm(raw);
+      if (!d) return false;
+      return d >= dayRange.start && d <= dayRange.end;
+    }
+    if (op === 'not_on_journal_day') {
+      const d = this._coerceDateForTm(raw);
+      if (!d) return true;
+      return !(d >= dayRange.start && d <= dayRange.end);
+    }
+    if (op === 'same_day_last_year') {
+      const d = this._coerceDateForTm(raw);
+      if (!d) return false;
+      return d >= lastYearRange.start && d <= lastYearRange.end;
+    }
+
+    const v = value(raw);
+    if (op === 'eq') return v === cmp;
+    if (op === 'neq') return v !== cmp;
+    if (op === 'contains') return v.includes(cmp);
+    if (op === 'not_contains') return !v.includes(cmp);
+    if (op === 'starts_with') return v.startsWith(cmp);
+    if (op === 'ends_with') return v.endsWith(cmp);
+    return true;
+  }
+
+  async _queryTimeMachineRecords(journalYyyymmdd) {
+    const excludedSet = new Set((this._settings.excludedCollections || []).map((n) => n.toLowerCase()));
+    const journalNames = new Set(['journal', 'journals']);
+    const collections = await this.data.getAllCollections();
+    const out = [];
+    for (const coll of collections) {
+      const name = coll.getName() || '';
+      if (!name || journalNames.has(name.toLowerCase())) continue;
+      if (excludedSet.has(name.toLowerCase())) continue;
+      let records;
+      try { records = await coll.getAllRecords(); } catch (_) { continue; }
+      const icon = this._collectionIconName(coll);
+      const tm0 = this._normalizeTimeMachine(this._settings.timeMachine).filters[0];
+      for (const record of records) {
+        if (!this._recordPassesTmFilters(record, journalYyyymmdd)) continue;
+        let dateVal = this._getDateFieldValue(record);
+        if (tm0?.field) {
+          const named = this._readDateFieldNamed(record, tm0.field);
+          if (named) dateVal = named;
+        }
+        const d = this._coerceDateForTm(dateVal);
+        out.push({ record, collectionName: name, dateVal: d || dateVal || null, collectionIcon: icon });
+      }
+    }
+    out.sort((a, b) => {
+      const c = a.collectionName.localeCompare(b.collectionName);
+      if (c !== 0) return c;
+      const ta = a.dateVal instanceof Date && !Number.isNaN(a.dateVal.getTime()) ? a.dateVal.getTime() : 0;
+      const tb = b.dateVal instanceof Date && !Number.isNaN(b.dateVal.getTime()) ? b.dateVal.getTime() : 0;
+      return ta - tb;
+    });
+    return out;
+  }
+
+  async _runTimeMachineGenerate(state) {
+    if (!this._timeMachineEnabled() || !state?.journalDate) return;
+    state.timeMachineLoading = true;
+    this._renderFooterBody(state);
+    this._syncTnHeaderExtras(state);
+    try {
+      state.timeMachineResults = await this._queryTimeMachineRecords(state.journalDate);
+    } catch (e) {
+      console.error('[TodaysNotes] Time Machine', e);
+      state.timeMachineResults = [];
+    }
+    state.timeMachineLoading = false;
+    this._renderFooterBody(state);
+    this._syncTnHeaderExtras(state);
+  }
+
+  _renderFooterBody(state) {
+    const targetRootEl = state?.rootEl;
+    if (!targetRootEl?.isConnected) return;
+    const bodyEl = targetRootEl.querySelector('[data-role="body"]');
+    if (!bodyEl) return;
+    const countEl = targetRootEl.querySelector('[data-role="count"]');
+    const results = state._lastMainResults || [];
+    bodyEl.innerHTML = '';
+
+    if (this._collapsed) {
+      this._syncTnHeaderExtras(state);
+      return;
+    }
+
+    if (!results.length) {
+      if (countEl) countEl.textContent = '';
+      if (!this._timeMachineEnabled()) {
+        bodyEl.innerHTML = '<div class="tn-empty">No notes found for this day.</div>';
+      }
+    } else {
+      if (countEl) countEl.textContent = String(results.length);
+      const byColl = this._groupResultsByCollection(results);
+      for (const [collName, items] of byColl) {
+        const sk = this._collectionSectionKey(collName);
+        if (!(sk in state._sectionCollapsed)) state._sectionCollapsed[sk] = false;
+        if (state._sectionCollapsed[sk]) continue;
+        const icon = (state._lastCollectionIcons && state._lastCollectionIcons[collName]) || '';
+        bodyEl.appendChild(this._buildCollectionSectionEl(collName, items, icon, sk, state));
+      }
+    }
+
+    if (this._timeMachineEnabled()) {
+      if (!(TN_TM_SECTION_KEY in state._sectionCollapsed)) state._sectionCollapsed[TN_TM_SECTION_KEY] = false;
+      if (!state._sectionCollapsed[TN_TM_SECTION_KEY]) {
+        bodyEl.appendChild(this._buildTimeMachineSectionEl(state));
+      }
+    }
+
+    const hasCollapsed = Object.keys(state._sectionCollapsed || {}).some((k) => state._sectionCollapsed[k]);
+    const hasMain = results.length > 0;
+    if (!hasMain && bodyEl.children.length === 0 && !hasCollapsed && !this._timeMachineEnabled()) {
+      bodyEl.innerHTML = '<div class="tn-empty">No notes found for this day.</div>';
+    } else if (!hasMain && bodyEl.children.length === 0 && hasCollapsed && !this._timeMachineEnabled()) {
+      bodyEl.innerHTML = '';
+    }
+    this._syncTnHeaderExtras(state);
+  }
+
+  _buildCollectionSectionEl(collName, items, rawIcon, sectionKey, state) {
+    const wrap = document.createElement('div');
+    wrap.className = 'tn-section';
+
+    const head = document.createElement('div');
+    head.className = 'tn-section-head';
+
+    const hoverWrap = document.createElement('div');
+    hoverWrap.className = 'tn-section-head-inner';
+
+    const iconWrap = document.createElement('span');
+    iconWrap.className = 'tn-section-icon';
+    if (!this._appendCollectionIconVisual(iconWrap, rawIcon)) {
+      try { iconWrap.appendChild(this.ui.createIcon('ti-folder')); } catch (_) { iconWrap.textContent = '📁'; }
+    }
+
+    const title = document.createElement('div');
+    title.className = 'tn-section-title';
+    title.textContent = collName;
+
+    const collapseBtn = document.createElement('button');
+    collapseBtn.type = 'button';
+    collapseBtn.className = 'tn-section-collapse-btn button-none';
+    collapseBtn.innerHTML = '<i class="ti ti-chevron-up" aria-hidden="true"></i>';
+    collapseBtn.title = 'Collapse section';
+    const collapse = (ev) => {
+      if (ev) { ev.preventDefault(); ev.stopPropagation(); }
+      state._sectionCollapsed[sectionKey] = true;
+      this._renderFooterBody(state);
+      this._syncTnHeaderExtras(state);
+    };
+    collapseBtn.addEventListener('click', collapse);
+    hoverWrap.addEventListener('click', (ev) => {
+      if (ev.target.closest?.('.tn-section-collapse-btn')) return;
+      collapse(ev);
+    });
+
+    hoverWrap.append(iconWrap, title, collapseBtn);
+    head.appendChild(hoverWrap);
+    wrap.appendChild(head);
+
+    const list = document.createElement('div');
+    list.className = 'tn-section-body';
+    for (const item of items) list.appendChild(this._buildRow(item, state));
+    wrap.appendChild(list);
+    return wrap;
+  }
+
+  _buildTimeMachineSectionEl(state) {
+    const wrap = document.createElement('div');
+    wrap.className = 'tn-section tn-tm-section';
+
+    const head = document.createElement('div');
+    head.className = 'tn-section-head tn-tm-head';
+    const iconWrap = document.createElement('span');
+    iconWrap.className = 'tn-section-icon';
+    try {
+      iconWrap.appendChild(this.ui.createIcon('ti-hourglass'));
+    } catch (_) {
+      iconWrap.textContent = '⏳';
+    }
+    const title = document.createElement('div');
+    title.className = 'tn-section-title';
+    title.textContent = 'Time Machine';
+
+    const genBtn = document.createElement('button');
+    genBtn.type = 'button';
+    genBtn.className = 'tn-tm-head-generate button-none button-small button-minimal-hover';
+    genBtn.title = 'Find notes matching your Time Machine filters';
+    this._appendTmGenerateIcon(genBtn, 18);
+    genBtn.disabled = !!state.timeMachineLoading;
+    genBtn.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      this._runTimeMachineGenerate(state);
+    });
+
+    const collapseBtn = document.createElement('button');
+    collapseBtn.type = 'button';
+    collapseBtn.className = 'tn-section-collapse-btn button-none';
+    collapseBtn.innerHTML = '<i class="ti ti-chevron-up" aria-hidden="true"></i>';
+    collapseBtn.title = 'Collapse Time Machine';
+    collapseBtn.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      state._sectionCollapsed[TN_TM_SECTION_KEY] = true;
+      this._renderFooterBody(state);
+      this._syncTnHeaderExtras(state);
+    });
+    const headInner = document.createElement('div');
+    headInner.className = 'tn-section-head-inner';
+    headInner.append(iconWrap, title, genBtn, collapseBtn);
+    head.appendChild(headInner);
+    wrap.appendChild(head);
+
+    const body = document.createElement('div');
+    body.className = 'tn-section-body tn-tm-body';
+    wrap.appendChild(body);
+
+    if (state.timeMachineLoading) {
+      const loading = document.createElement('div');
+      loading.className = 'tn-loading';
+      loading.textContent = 'Loading Time Machine…';
+      body.appendChild(loading);
+      return wrap;
+    }
+
+    if (state.timeMachineResults == null) {
+      return wrap;
+    }
+
+    if (!state.timeMachineResults.length) {
+      const empty = document.createElement('div');
+      empty.className = 'tn-empty';
+      empty.textContent = 'No records matched your Time Machine filters.';
+      body.appendChild(empty);
+      return wrap;
+    }
+
+    const byColl = this._groupResultsByCollection(state.timeMachineResults);
+    for (const [collName, items] of byColl) {
+      const subLabel = document.createElement('div');
+      subLabel.className = 'tn-tm-subcoll';
+      subLabel.textContent = collName;
+      body.appendChild(subLabel);
+      for (const item of items) body.appendChild(this._buildRow(item, state));
+    }
+    return wrap;
+  }
+
   _buildRoot(state) {
     const root = document.createElement('div');
     root.className       = 'tn-footer';
@@ -810,11 +1547,38 @@ class Plugin extends AppPlugin {
 
     const titleEl = document.createElement('div');
     titleEl.className   = 'tn-title';
-    titleEl.textContent = "Today's Notes";
+    titleEl.textContent = this._panelTitleText();
 
     const countEl = document.createElement('div');
     countEl.className    = 'tn-count';
     countEl.dataset.role = 'count';
+
+    const collapsedSectionsWrap = document.createElement('span');
+    collapsedSectionsWrap.className = 'tn-collapsed-sections-wrap';
+
+    const tmHeaderBtn = document.createElement('button');
+    tmHeaderBtn.type = 'button';
+    tmHeaderBtn.className = 'tn-tm-header-btn button-none button-small button-minimal-hover';
+    tmHeaderBtn.title = 'Expand Time Machine section';
+    tmHeaderBtn.style.display = 'none';
+    tmHeaderBtn.setAttribute('aria-label', 'Expand Time Machine section');
+    this._appendTmGenerateIcon(tmHeaderBtn, 18);
+    tmHeaderBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (!this._timeMachineEnabled()) return;
+      state._sectionCollapsed[TN_TM_SECTION_KEY] = false;
+      if (this._collapsed) {
+        this._collapsed = false;
+        this._saveBool('tn_footer_collapsed', this._collapsed);
+        const body = root.querySelector('[data-role="body"]');
+        const tgl = root.querySelector('.tn-toggle');
+        if (body) body.style.display = 'block';
+        if (tgl) tgl.textContent = '−';
+      }
+      this._renderFooterBody(state);
+      this._syncTnHeaderExtras(state);
+    });
 
     const settingsBtn = document.createElement('button');
     settingsBtn.type      = 'button';
@@ -827,6 +1591,8 @@ class Plugin extends AppPlugin {
     header.appendChild(titleIcon);
     header.appendChild(titleEl);
     header.appendChild(countEl);
+    header.appendChild(collapsedSectionsWrap);
+    header.appendChild(tmHeaderBtn);
     header.appendChild(settingsBtn);
 
     const body = document.createElement('div');
@@ -835,10 +1601,16 @@ class Plugin extends AppPlugin {
     body.style.display = this._collapsed ? 'none' : 'block';
 
     toggle.addEventListener('click', () => {
+      const wasCollapsed = this._collapsed;
       this._collapsed    = !this._collapsed;
+      if (!this._collapsed && wasCollapsed && this._allInnerTnSectionsCollapsed(state)) {
+        this._expandAllTnSections(state);
+      }
       this._saveBool('tn_footer_collapsed', this._collapsed);
       toggle.textContent = this._collapsed ? '+' : '−';
       body.style.display = this._collapsed ? 'none' : 'block';
+      if (!this._collapsed) this._renderFooterBody(state);
+      this._syncTnHeaderExtras(state);
     });
 
     root.addEventListener('click', (e) => this._handleClick(e, state));
@@ -906,6 +1678,8 @@ class Plugin extends AppPlugin {
     const bodyEl = targetRootEl?.querySelector('[data-role="body"]');
     if (!bodyEl) { state.loading = false; return; }
 
+    this._syncFooterTitles();
+
     bodyEl.innerHTML = '<div class="tn-loading">Loading…</div>';
 
     try {
@@ -919,29 +1693,21 @@ class Plugin extends AppPlugin {
       }
       if (!state.rootEl.isConnected) { state.loading = false; return; }
 
-      const countEl = state.rootEl.querySelector('[data-role="count"]');
-      bodyEl.innerHTML = '';
+      if (!this._timeMachineEnabled()) {
+        state.timeMachineResults = null;
+        state.timeMachineLoading = false;
+      }
 
-      if (results.length === 0) {
-        bodyEl.innerHTML = '<div class="tn-empty">No notes found for this day.</div>';
-        if (countEl) countEl.textContent = '';
-      } else {
-        if (countEl) countEl.textContent = String(results.length);
-
-        const byCollection = new Map();
-        for (const item of results) {
-          if (!byCollection.has(item.collectionName)) byCollection.set(item.collectionName, []);
-          byCollection.get(item.collectionName).push(item);
-        }
-
-        for (const [collName, items] of byCollection) {
-          const label = document.createElement('div');
-          label.className   = 'tn-coll-label';
-          label.textContent = collName;
-          bodyEl.appendChild(label);
-          for (const item of items) bodyEl.appendChild(this._buildRow(item, state));
+      state._lastMainResults = results;
+      state._lastCollectionIcons = {};
+      for (const item of results) {
+        const n = item.collectionName;
+        if (n && item.collectionIcon && !state._lastCollectionIcons[n]) {
+          state._lastCollectionIcons[n] = item.collectionIcon;
         }
       }
+
+      this._renderFooterBody(state);
 
       state.loaded = true;
     } catch (e) {
@@ -1261,7 +2027,7 @@ class Plugin extends AppPlugin {
     const now = Date.now();
     const hit = this._recordsByDateCache?.get?.(cacheKey);
     if (hit && (now - hit.ts) < TN_QUERY_CACHE_TTL_MS && Array.isArray(hit.results)) {
-      return hit.results;
+      return hit.results.map((x) => ({ ...x }));
     }
 
     const y = parseInt(yyyymmdd.slice(0,4), 10);
@@ -1274,7 +2040,6 @@ class Plugin extends AppPlugin {
     const journalNames = new Set(['journal', 'journals']);
     const collections  = await this.data.getAllCollections();
 
-    // Fetch all collections in parallel instead of sequentially
     const perColl = await Promise.all(
       collections.map(async (coll) => {
         const name = coll.getName() || '';
@@ -1285,12 +2050,13 @@ class Plugin extends AppPlugin {
         let records;
         try { records = await coll.getAllRecords(); } catch (_) { return []; }
 
+        const collIcon = this._collectionIconName(coll);
         const matches = [];
         for (const record of records) {
           const dateVal = this._getDateFieldValue(record);
           if (!dateVal) continue;
           if (dateVal >= dayStart && dateVal <= dayEnd) {
-            matches.push({ record, collectionName: name, dateVal });
+            matches.push({ record, collectionName: name, dateVal, collectionIcon: collIcon });
           }
         }
         return matches;
@@ -1415,6 +2181,105 @@ class Plugin extends AppPlugin {
         white-space: nowrap;
         font-variant-numeric: tabular-nums;
       }
+      .tn-footer .tn-collapsed-sections-wrap {
+        display: inline-flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 4px;
+        justify-content: flex-end;
+        max-width: 42%;
+      }
+      .tn-footer .tn-collapsed-chip {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 26px;
+        height: 26px;
+        border-radius: 6px;
+        border: 1px solid rgba(255,255,255,0.12);
+        color: #8a7e6a;
+        flex-shrink: 0;
+      }
+      .tn-footer .tn-collapsed-chip:hover {
+        background: rgba(255,255,255,0.06);
+        color: #e8e0d0;
+      }
+      .tn-footer .tn-collapsed-chip-icon {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 14px;
+      }
+      .tn-footer .tn-tm-header-btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 26px;
+        height: 26px;
+        color: #8a7e6a;
+        flex-shrink: 0;
+        padding: 0;
+        line-height: 0;
+      }
+      .tn-footer .tn-tm-header-btn:hover { color: #e8e0d0; }
+      .tn-footer .tn-section {
+        margin-top: 10px;
+        border-top: 1px solid rgba(255,255,255,0.08);
+        padding-top: 8px;
+      }
+      .tn-footer .tn-section:first-of-type { margin-top: 0; border-top: none; padding-top: 0; }
+      .tn-footer .tn-section-head { margin-bottom: 6px; }
+      .tn-footer .tn-section-head-inner {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        cursor: pointer;
+        user-select: none;
+      }
+      .tn-footer .tn-section-icon {
+        display: inline-flex;
+        align-items: center;
+        color: #8a7e6a;
+        flex-shrink: 0;
+      }
+      .tn-footer .tn-section-title {
+        flex: 1;
+        font-size: 10px;
+        font-weight: 700;
+        letter-spacing: 0.07em;
+        text-transform: uppercase;
+        color: #8a7e6a;
+      }
+      .tn-footer .tn-section-collapse-btn {
+        color: #8a7e6a;
+        padding: 0 4px;
+        font-size: 14px;
+        flex-shrink: 0;
+      }
+      .tn-footer .tn-section-collapse-btn:hover { color: #e8e0d0; }
+      .tn-footer .tn-section-body { padding-left: 2px; }
+      .tn-footer .tn-tm-section { border-top: 1px solid rgba(255,255,255,0.08); }
+      .tn-footer .tn-tm-head-generate {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        flex-shrink: 0;
+        color: #8a7e6a;
+        padding: 0 2px;
+        line-height: 0;
+        margin-right: 2px;
+      }
+      .tn-footer .tn-tm-head-generate:hover:not(:disabled) { color: #e8e0d0; }
+      .tn-footer .tn-tm-head-generate:disabled { opacity: 0.45; cursor: default; }
+      .tn-footer .tn-tm-subcoll {
+        font-size: 10px;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: #8a7e6a;
+        margin: 8px 0 4px;
+      }
+      .tn-footer .tn-collection-icon-emoji { font-size: 14px; line-height: 1; }
       .tn-footer .tn-settings-btn {
         font-size: 13px;
         color: #8a7e6a;
@@ -1431,14 +2296,6 @@ class Plugin extends AppPlugin {
         color: #8a7e6a;
         padding: 4px 0 6px;
         font-style: italic;
-      }
-      .tn-footer .tn-coll-label {
-        font-size: 10px;
-        font-weight: 700;
-        letter-spacing: 0.07em;
-        text-transform: uppercase;
-        color: #8a7e6a;
-        padding: 8px 0 3px;
       }
       .tn-footer .tn-record-group {
         margin: 0 -6px;
