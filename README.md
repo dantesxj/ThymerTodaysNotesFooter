@@ -15,7 +15,7 @@ Footer panel for journal pages that shows records whose date fields match the cu
 
 ## Storage mode
 
-Includes Path B support (`Plugin Settings` collection + localStorage mirror):
+Includes Path B support (**Plugin Backend** collection + localStorage mirror; legacy **Plugin Settings** name still resolved):
 
 - Command Palette: `Today's Notes: Storage location…`
 - Can store settings local-only or synced across devices/workspaces.
