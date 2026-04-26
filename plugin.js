@@ -13,8 +13,8 @@
  *
  * Edit this file, then from repo root: npm run embed-plugin-settings
  *
- * Debug: console filter `[ThymerExt/PluginBackend]`. To silence:
- *   localStorage.setItem('thymerext_debug_collections', '0'); location.reload();
+ * Debug: console filter `[ThymerExt/PluginBackend]`. Off by default; to enable:
+ *   localStorage.setItem('thymerext_debug_collections', '1'); location.reload();
  *
  * Rows:
  * - **Vault** (`record_kind` = `vault`): one per `plugin_id` — holds synced localStorage payload JSON.
@@ -43,14 +43,16 @@
 
   /**
    * Collection ensure diagnostics (read browser console for `[ThymerExt/PluginBackend]`.
-   * Disable: `localStorage.setItem('thymerext_debug_collections','0')` then reload.
+   * Opt-in: `localStorage.setItem('thymerext_debug_collections','1')` then reload.
+   * Opt-out: remove the key or set to `0` / `off` / `false`.
    */
   const DEBUG_COLLECTIONS = (() => {
     try {
       const o = localStorage.getItem('thymerext_debug_collections');
       if (o === '0' || o === 'off' || o === 'false') return false;
+      return o === '1' || o === 'true' || o === 'on';
     } catch (_) {}
-    return true;
+    return false;
   })();
   const DEBUG_PATHB_ID =
     'pb-' + (Date.now() & 0xffffffff).toString(16) + '-' + Math.random().toString(36).slice(2, 7);
@@ -818,6 +820,169 @@
     return s;
   }
 
+  /** Configured collection name only (avoids duplicating `collectionDisplayName` fallbacks). */
+  function collectionBackendConfiguredTitle(c) {
+    if (!c) return '';
+    try {
+      return String(c.getConfiguration?.()?.name || '').trim();
+    } catch (_) {
+      return '';
+    }
+  }
+
+  /**
+   * When plugin iframes are opaque (blob/sandbox), `navigator.locks` and `window.top` globals do not
+   * dedupe across realms. First `localStorage` we can reach on the Thymer app origin is shared.
+   */
+  function getSharedThymerLocalStorage() {
+    const seen = new Set();
+    const tryWin = (w) => {
+      if (!w || seen.has(w)) return null;
+      seen.add(w);
+      try {
+        const ls = w.localStorage;
+        void ls.length;
+        return ls;
+      } catch (_) {
+        return null;
+      }
+    };
+    try {
+      const t = tryWin(window.top);
+      if (t) return t;
+    } catch (_) {}
+    try {
+      const t = tryWin(window);
+      if (t) return t;
+    } catch (_) {}
+    try {
+      let w = window;
+      for (let i = 0; i < 10 && w; i++) {
+        const t = tryWin(w);
+        if (t) return t;
+        if (w === w.parent) break;
+        w = w.parent;
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  const LS_CREATE_LEASE_KEY = 'thymerext_plugin_backend_create_lease_v1';
+  const LS_RECENT_CREATE_KEY = 'thymerext_plugin_backend_recent_create_v1';
+  const LS_RECENT_CREATE_ATTEMPT_KEY = 'thymerext_plugin_backend_recent_create_attempt_v1';
+
+  /**
+   * Cross-realm mutex for `createCollection` + first `saveConfiguration` only.
+   * @returns {{ denied: boolean, release: () => void }}
+   */
+  async function acquirePluginBackendCreationLease(maxWaitMs) {
+    const noop = { denied: false, release() {} };
+    const ls = getSharedThymerLocalStorage();
+    if (!ls) return noop;
+    const holder =
+      (typeof crypto !== 'undefined' && crypto.randomUUID && crypto.randomUUID()) ||
+      `${Date.now()}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
+    const deadline = Date.now() + (Number(maxWaitMs) > 0 ? maxWaitMs : 12000);
+    let acquired = false;
+    let sawContention = false;
+    while (Date.now() < deadline) {
+      try {
+        const raw = ls.getItem(LS_CREATE_LEASE_KEY);
+        let busy = false;
+        if (raw) {
+          let j = null;
+          try {
+            j = JSON.parse(raw);
+          } catch (_) {
+            j = null;
+          }
+          if (j && typeof j.exp === 'number' && j.h !== holder && j.exp > Date.now()) busy = true;
+        }
+        if (busy) {
+          sawContention = true;
+          await new Promise((r) => setTimeout(r, 40 + Math.floor(Math.random() * 70)));
+          continue;
+        }
+        const exp = Date.now() + 45000;
+        const payload = JSON.stringify({ h: holder, exp });
+        ls.setItem(LS_CREATE_LEASE_KEY, payload);
+        await new Promise((r) => setTimeout(r, 0));
+        if (ls.getItem(LS_CREATE_LEASE_KEY) === payload) {
+          acquired = true;
+          if (DEBUG_COLLECTIONS) dlogPathB('lease_acquired', { via: 'localStorage', sawContention });
+          break;
+        }
+      } catch (_) {
+        return noop;
+      }
+      await new Promise((r) => setTimeout(r, 30 + Math.floor(Math.random() * 50)));
+    }
+    if (!acquired) {
+      if (DEBUG_COLLECTIONS) dlogPathB('lease_timeout_abort_create', { sawContention });
+      return { denied: true, release() {} };
+    }
+    return {
+      denied: false,
+      release() {
+        if (!acquired) return;
+        acquired = false;
+        try {
+          const cur = ls.getItem(LS_CREATE_LEASE_KEY);
+          if (!cur) return;
+          let j = null;
+          try {
+            j = JSON.parse(cur);
+          } catch (_) {
+            return;
+          }
+          if (j && j.h === holder) ls.removeItem(LS_CREATE_LEASE_KEY);
+        } catch (_) {}
+      },
+    };
+  }
+
+  function noteRecentPluginBackendCreate() {
+    const ls = getSharedThymerLocalStorage();
+    if (!ls) return;
+    try {
+      ls.setItem(LS_RECENT_CREATE_KEY, String(Date.now()));
+    } catch (_) {}
+  }
+
+  function getRecentPluginBackendCreateAgeMs() {
+    const ls = getSharedThymerLocalStorage();
+    if (!ls) return null;
+    try {
+      const raw = ls.getItem(LS_RECENT_CREATE_KEY);
+      const ts = Number(raw);
+      if (!Number.isFinite(ts) || ts <= 0) return null;
+      return Date.now() - ts;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function noteRecentPluginBackendCreateAttempt() {
+    const ls = getSharedThymerLocalStorage();
+    if (!ls) return;
+    try {
+      ls.setItem(LS_RECENT_CREATE_ATTEMPT_KEY, String(Date.now()));
+    } catch (_) {}
+  }
+
+  function getRecentPluginBackendCreateAttemptAgeMs() {
+    const ls = getSharedThymerLocalStorage();
+    if (!ls) return null;
+    try {
+      const raw = ls.getItem(LS_RECENT_CREATE_ATTEMPT_KEY);
+      const ts = Number(raw);
+      if (!Number.isFinite(ts) || ts <= 0) return null;
+      return Date.now() - ts;
+    } catch (_) {
+      return null;
+    }
+  }
+
   /** When Thymer omits names on `getAllCollections()` entries, match our Path B schema. */
   function pathBCollectionScore(c) {
     if (!c) return 0;
@@ -854,7 +1019,8 @@
     if (!cands.length) return null;
     const named = cands.find((c) => {
       const n = collectionDisplayName(c);
-      return n === COL_NAME || n === COL_NAME_LEGACY;
+      const cfg = collectionBackendConfiguredTitle(c);
+      return n === COL_NAME || n === COL_NAME_LEGACY || cfg === COL_NAME || cfg === COL_NAME_LEGACY;
     });
     return named || cands[0];
   }
@@ -866,6 +1032,8 @@
         return (
           list.find((c) => collectionDisplayName(c) === COL_NAME) ||
           list.find((c) => collectionDisplayName(c) === COL_NAME_LEGACY) ||
+          list.find((c) => collectionBackendConfiguredTitle(c) === COL_NAME) ||
+          list.find((c) => collectionBackendConfiguredTitle(c) === COL_NAME_LEGACY) ||
           null
         );
       };
@@ -888,6 +1056,8 @@
     for (const c of all) {
       const nm = collectionDisplayName(c);
       if (nm === COL_NAME || nm === COL_NAME_LEGACY) return true;
+      const cfg = collectionBackendConfiguredTitle(c);
+      if (cfg === COL_NAME || cfg === COL_NAME_LEGACY) return true;
     }
     return !!pickPathBCollectionHeuristic(all);
   }
@@ -1031,16 +1201,52 @@
         void 0;
       }
       if (DEBUG_COLLECTIONS) dlogPathB('ensureBody_about_to_create', { pathB: pathBWindowSnapshot() });
-      const coll = await queueDataCreateOnSharedWindow(() => data.createCollection());
-      if (!coll || typeof coll.getConfiguration !== 'function' || typeof coll.saveConfiguration !== 'function') {
-        return;
+      const lease = await acquirePluginBackendCreationLease(14000);
+      if (lease.denied) return;
+      try {
+        if (await findColl(data)) return;
+        if (await hasPluginBackendOnWorkspace(data)) return;
+        const recentAttemptAge = getRecentPluginBackendCreateAttemptAgeMs();
+        if (recentAttemptAge != null && recentAttemptAge >= 0 && recentAttemptAge < 120000) {
+          // Another plugin iframe attempted creation very recently. Avoid burst duplicate creates.
+          for (let i = 0; i < 10; i++) {
+            await new Promise((r) => setTimeout(r, 130 + i * 70));
+            if (await findColl(data)) return;
+            if (await hasPluginBackendOnWorkspace(data)) return;
+          }
+          return;
+        }
+        const recentAge = getRecentPluginBackendCreateAgeMs();
+        if (recentAge != null && recentAge >= 0 && recentAge < 90000) {
+          // Another plugin/runtime likely just created it; let collection list/indexing settle first.
+          for (let i = 0; i < 8; i++) {
+            await new Promise((r) => setTimeout(r, 120 + i * 60));
+            if (await findColl(data)) return;
+            if (await hasPluginBackendOnWorkspace(data)) return;
+          }
+        }
+        noteRecentPluginBackendCreateAttempt();
+        const coll = await queueDataCreateOnSharedWindow(() => data.createCollection());
+        if (!coll || typeof coll.getConfiguration !== 'function' || typeof coll.saveConfiguration !== 'function') {
+          return;
+        }
+        const conf = cloneShape();
+        const base = coll.getConfiguration();
+        if (base && typeof base.ver === 'number') conf.ver = base.ver;
+        let ok = await coll.saveConfiguration(conf);
+        if (ok === false) {
+          // Transient host races can reject the first save; retry before giving up.
+          await new Promise((r) => setTimeout(r, 180));
+          ok = await coll.saveConfiguration(conf);
+        }
+        if (ok === false) return;
+        noteRecentPluginBackendCreate();
+        await new Promise((r) => setTimeout(r, 250));
+      } finally {
+        try {
+          lease.release();
+        } catch (_) {}
       }
-      const conf = cloneShape();
-      const base = coll.getConfiguration();
-      if (base && typeof base.ver === 'number') conf.ver = base.ver;
-      const ok = await coll.saveConfiguration(conf);
-      if (ok === false) return;
-      await new Promise((r) => setTimeout(r, 250));
     } catch (e) {
       console.error('[ThymerPluginSettings] ensure collection', e);
     }
@@ -1566,7 +1772,7 @@ class Plugin extends AppPlugin {
     }
     this._eventHandlerIds = [];
     this._recordsByDateCache?.clear?.();
-    for (const id of Array.from((this._panelStates || new Map()).keys())) this._disposePanel(id);
+    for (const id of Array.from((this._panelStates || new Map()).keys())) this._disposePanel(id, { permanent: true });
     this._panelStates?.clear();
   }
 
@@ -1697,13 +1903,19 @@ class Plugin extends AppPlugin {
 
   async _openSettings() {
     const panel = await this.ui.createPanel();
-    if (panel) panel.navigateToCustomType('tn-settings');
+    if (!panel) return;
+    const type = this._tnJournalFooterSuiteEmbed ? 'jfs-settings' : 'tn-settings';
+    panel.navigateToCustomType(type);
   }
 
-  async _mountSettingsPanel(panel) {
-    const el = panel.getElement();
-    if (!el) return;
-    panel.setTitle("Today's Notes — Settings");
+  /**
+   * Build Today's Notes settings form into containerEl.
+   * @param {HTMLElement} containerEl
+   * @param {{ suiteEmbed?: boolean }} opts — suiteEmbed: omit inner save button (parent saves).
+   * @returns {Promise<() => void>} applyDraft — persist `s` to plugin settings (no UI).
+   */
+  async _appendTodaysNotesSettingsInto(containerEl, opts = {}) {
+    const suiteEmbed = !!opts.suiteEmbed;
 
     const allCollections = await this.data.getAllCollections();
     const journalNames   = new Set(['journal', 'journals']);
@@ -1720,10 +1932,11 @@ class Plugin extends AppPlugin {
     };
 
     const render = () => {
-      el.innerHTML = '';
-      el.style.cssText = 'padding:0;overflow:auto;height:100%;box-sizing:border-box;';
+      containerEl.innerHTML = '';
       const wrap = document.createElement('div');
-      wrap.style.cssText = 'padding:24px;max-width:560px;margin:0 auto;display:flex;flex-direction:column;gap:20px;';
+      wrap.style.cssText = suiteEmbed
+        ? 'display:flex;flex-direction:column;gap:16px;'
+        : 'padding:24px;max-width:560px;margin:0 auto;display:flex;flex-direction:column;gap:20px;';
 
       // ── Panel title ─────────────────────────────────────────────────────
       const titleSec = document.createElement('div');
@@ -1877,27 +2090,42 @@ class Plugin extends AppPlugin {
       tmSec.appendChild(addTmFilter);
       wrap.appendChild(tmSec);
 
-      // ── Save ──────────────────────────────────────────────────────────
-      const saveBtn = document.createElement('button');
-      saveBtn.textContent = 'Save Settings';
-      saveBtn.style.cssText = 'padding:10px 0;background:var(--color-primary-500,#a78bfa);color:#fff;border:none;border-radius:8px;font-weight:700;font-size:14px;cursor:pointer;width:100%;';
-      saveBtn.addEventListener('click', () => {
-        this._settings = {
-          panelLabel:          String(s.panelLabel || '').trim(),
-          dateFields:          s.dateFields.filter(f => f.trim()),
-          excludedCollections: Array.from(s.excludedCollections),
-          timeMachine:         this._normalizeTimeMachine(s.timeMachine),
-        };
-        this._saveSettings();
-        this._syncFooterTitles();
-        this._refreshAll();
-        this.ui.addToaster({ title: 'Saved', message: "Today's Notes settings saved.", dismissible: true, autoDestroyTime: 3000 });
-      });
-      wrap.appendChild(saveBtn);
-      el.appendChild(wrap);
+      if (!suiteEmbed) {
+        const saveBtn = document.createElement('button');
+        saveBtn.textContent = 'Save Settings';
+        saveBtn.style.cssText = 'padding:10px 0;background:var(--color-primary-500,#a78bfa);color:#fff;border:none;border-radius:8px;font-weight:700;font-size:14px;cursor:pointer;width:100%;';
+        saveBtn.addEventListener('click', () => {
+          applyDraft();
+          this.ui.addToaster({ title: 'Saved', message: "Today's Notes settings saved.", dismissible: true, autoDestroyTime: 3000 });
+        });
+        wrap.appendChild(saveBtn);
+      }
+      containerEl.appendChild(wrap);
+    };
+
+    const applyDraft = () => {
+      this._settings = {
+        panelLabel:          String(s.panelLabel || '').trim(),
+        dateFields:          s.dateFields.filter(f => f.trim()),
+        excludedCollections: Array.from(s.excludedCollections),
+        timeMachine:         this._normalizeTimeMachine(s.timeMachine),
+      };
+      this._saveSettings();
+      this._syncFooterTitles();
+      this._refreshAll();
     };
 
     render();
+    return applyDraft;
+  }
+
+  async _mountSettingsPanel(panel) {
+    const el = panel.getElement();
+    if (!el) return;
+    panel.setTitle("Today's Notes — Settings");
+    el.innerHTML = '';
+    el.style.cssText = 'padding:0;overflow:auto;height:100%;box-sizing:border-box;';
+    await this._appendTodaysNotesSettingsInto(el, { suiteEmbed: false });
   }
 
   // =========================================================================
@@ -1967,18 +2195,25 @@ class Plugin extends AppPlugin {
         rootEl: null, observer: null,
         loading: false, loaded: false,
         recordExpandedState: new Map(),
-        _sectionCollapsed: state?._sectionCollapsed || {},
+        _sectionCollapsed: {},
         _lastMainResults: [],
         _lastCollectionIcons: {},
         timeMachineResults: null,
         timeMachineLoading: false,
       };
       this._panelStates.set(panelId, state);
+      const pKey = `${panelId}\t${String(journalDate || '')}`;
+      const prev = this._tnPreservedSectionCollapse?.get?.(pKey);
+      if (prev && typeof prev === 'object' && Object.keys(prev).length) {
+        state._sectionCollapsed = { ...prev };
+        this._tnPreservedSectionCollapse.delete(pKey);
+      }
     } else {
       // Disconnect container watcher if it exists (we found the container now)
       try { state._containerWatcher?.disconnect(); } catch (_) {}
       state._containerWatcher = null;
 
+      const priorJournalDate = state.journalDate;
       state.journalDate = journalDate;
       state.panel       = panel;
       state._sectionCollapsed = state._sectionCollapsed || {};
@@ -1986,6 +2221,10 @@ class Plugin extends AppPlugin {
       if (state.timeMachineLoading === undefined) state.timeMachineLoading = false;
       // Reset state when date changes
       if (dateChanged) {
+        if (this._tnJournalFooterSuiteEmbed && this._tnPreservedSectionCollapse) {
+          const oldKey = `${panelId}\t${String(priorJournalDate || '')}`;
+          this._tnPreservedSectionCollapse.delete(oldKey);
+        }
         state.loaded = false;
         state.recordExpandedState = new Map();
         state._sectionCollapsed = {};
@@ -2005,12 +2244,33 @@ class Plugin extends AppPlugin {
     }
   }
 
-  _disposePanel(panelId) {
+  _disposePanel(panelId, opts = {}) {
     if (!panelId) return;
     const s = this._panelStates.get(panelId);
     if (!s) return;
+
+    if (opts.permanent && this._tnPreservedSectionCollapse) {
+      const prefix = `${panelId}\t`;
+      for (const k of Array.from(this._tnPreservedSectionCollapse.keys())) {
+        if (k.startsWith(prefix)) this._tnPreservedSectionCollapse.delete(k);
+      }
+    } else if (this._tnJournalFooterSuiteEmbed && s) {
+      try {
+        if (!this._tnPreservedSectionCollapse) this._tnPreservedSectionCollapse = new Map();
+        const key = `${panelId}\t${String(s.journalDate || '')}`;
+        this._tnPreservedSectionCollapse.set(key, JSON.parse(JSON.stringify(s._sectionCollapsed || {})));
+      } catch (_) {}
+    }
+
     try { s.observer?.disconnect(); } catch (_) {}
     try { s._containerWatcher?.disconnect(); } catch (_) {}
+    if (this._tnJournalFooterSuiteEmbed && s.rootEl) {
+      const host = s.rootEl.closest?.('.jfs-shell')?.querySelector?.('.jfs-tn-extras');
+      if (host) {
+        host.innerHTML = '';
+        host.style.display = 'none';
+      }
+    }
     try { s.rootEl?.remove(); }       catch (_) {}
     this._panelStates.delete(panelId);
   }
@@ -2123,23 +2383,69 @@ class Plugin extends AppPlugin {
     if (this._timeMachineEnabled()) state._sectionCollapsed[TN_TM_SECTION_KEY] = false;
   }
 
+  /** Ensure `.jfs-tn-extras` in the Journal Footer shell has wrap + TM control (suite embed only). */
+  _ensureJfsTnExtrasShell(state, host) {
+    if (!host || host.querySelector('.tn-tm-header-btn')) return;
+    const wrap = document.createElement('span');
+    wrap.className = 'tn-collapsed-sections-wrap';
+    const tmHeaderBtn = document.createElement('button');
+    tmHeaderBtn.type = 'button';
+    tmHeaderBtn.className = 'tn-tm-header-btn button-none button-small button-minimal-hover';
+    tmHeaderBtn.title = 'Expand Time Machine and run query';
+    tmHeaderBtn.style.display = 'none';
+    tmHeaderBtn.setAttribute('aria-label', 'Expand Time Machine and run query');
+    this._appendTmGenerateIcon(tmHeaderBtn, 18);
+    tmHeaderBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (!this._timeMachineEnabled()) return;
+      state._sectionCollapsed[TN_TM_SECTION_KEY] = false;
+      this._renderFooterBody(state);
+      this._syncTnHeaderExtras(state);
+      void this._runTimeMachineGenerate(state);
+    });
+    host.appendChild(wrap);
+    host.appendChild(tmHeaderBtn);
+  }
+
   _syncTnHeaderExtras(state) {
-    const root = state?.rootEl;
-    if (!root) return;
-    const tmBtn = root.querySelector('.tn-tm-header-btn');
+    const tnRoot = state?.rootEl;
+    if (!tnRoot) return;
+    const footCollapsed = this._tnJournalFooterSuiteEmbed ? false : this._collapsed;
+
+    let tmBtn;
+    let wrap;
+    /** @type {HTMLElement | null} */
+    let jfsHost = null;
+
+    if (this._tnJournalFooterSuiteEmbed) {
+      jfsHost = tnRoot.closest?.('.jfs-shell')?.querySelector?.('.jfs-tn-extras');
+      if (!jfsHost) return;
+      this._ensureJfsTnExtrasShell(state, jfsHost);
+      tmBtn = jfsHost.querySelector('.tn-tm-header-btn');
+      wrap = jfsHost.querySelector('.tn-collapsed-sections-wrap');
+    } else {
+      tmBtn = tnRoot.querySelector('.tn-tm-header-btn');
+      wrap = tnRoot.querySelector('.tn-collapsed-sections-wrap');
+    }
+
+    if (!wrap) return;
+
+    let tmHeaderVisible = false;
     if (tmBtn) {
       if (!this._timeMachineEnabled()) {
         tmBtn.style.display = 'none';
       } else {
         const tmCollapsed = !!state._sectionCollapsed?.[TN_TM_SECTION_KEY];
-        tmBtn.style.display = tmCollapsed && !this._collapsed ? '' : 'none';
+        tmBtn.style.display = tmCollapsed && !footCollapsed ? '' : 'none';
+        tmHeaderVisible = tmBtn.style.display !== 'none';
         tmBtn.title = 'Expand Time Machine and run query';
       }
     }
-    const wrap = root.querySelector('.tn-collapsed-sections-wrap');
-    if (!wrap) return;
+
     wrap.innerHTML = '';
-    if (this._collapsed) return;
+    if (footCollapsed) return;
+
     const byColl = this._groupResultsByCollection(state._lastMainResults || []);
     for (const collName of byColl.keys()) {
       const sk = this._collectionSectionKey(collName);
@@ -2160,11 +2466,11 @@ class Plugin extends AppPlugin {
         ev.preventDefault();
         ev.stopPropagation();
         state._sectionCollapsed[sk] = false;
-        if (this._collapsed) {
+        if (this._collapsed && !this._tnJournalFooterSuiteEmbed) {
           this._collapsed = false;
           this._saveBool('tn_footer_collapsed', this._collapsed);
-          const body = root.querySelector('[data-role="body"]');
-          const tgl = root.querySelector('.tn-toggle');
+          const body = tnRoot.querySelector('[data-role="body"]');
+          const tgl = tnRoot.querySelector('.tn-toggle');
           if (body) body.style.display = 'block';
           if (tgl) tgl.textContent = '−';
         }
@@ -2172,6 +2478,11 @@ class Plugin extends AppPlugin {
         this._syncTnHeaderExtras(state);
       });
       wrap.appendChild(btn);
+    }
+
+    if (jfsHost) {
+      const hasChips = wrap.childElementCount > 0;
+      jfsHost.style.display = hasChips || tmHeaderVisible ? 'flex' : 'none';
     }
 
     // Time Machine when collapsed uses `.tn-tm-header-btn` only (avoid duplicate header icons).
@@ -2504,7 +2815,7 @@ class Plugin extends AppPlugin {
     const results = state._lastMainResults || [];
     bodyEl.innerHTML = '';
 
-    if (this._collapsed) {
+    if (this._collapsed && !this._tnJournalFooterSuiteEmbed) {
       this._syncTnHeaderExtras(state);
       return;
     }
@@ -2663,8 +2974,19 @@ class Plugin extends AppPlugin {
 
   _buildRoot(state) {
     const root = document.createElement('div');
-    root.className       = 'tn-footer';
+    root.className       = this._tnJournalFooterSuiteEmbed ? 'tn-footer tn-footer--suite-embed' : 'tn-footer';
     root.dataset.panelId = state.panelId;
+
+    if (this._tnJournalFooterSuiteEmbed) {
+      // Collapsed chips + TM shortcut live in `.jfs-tn-extras` (same row as tabs); see `_syncTnHeaderExtras`.
+      const body = document.createElement('div');
+      body.dataset.role  = 'body';
+      body.className     = 'tn-body';
+      body.style.display = 'block';
+      root.addEventListener('click', (e) => this._handleClick(e, state));
+      root.appendChild(body);
+      return root;
+    }
 
     const header = document.createElement('div');
     header.className = 'tn-header';
@@ -3558,6 +3880,26 @@ class Plugin extends AppPlugin {
       .tn-footer .tn-seg-ref  { color: var(--color-primary-400,#c4b5fd); }
       .tn-footer .tn-seg-link { color: var(--color-primary-400,#c4b5fd); text-decoration: none; }
       .tn-footer .tn-seg-link:hover { text-decoration: underline; }
+
+      .tn-footer.tn-footer--suite-embed {
+        margin-top: 0;
+        margin-bottom: 0;
+        width: 100%;
+        max-width: none;
+        align-self: stretch;
+        box-sizing: border-box;
+        background: transparent;
+        border: none;
+        border-radius: 0;
+        padding: 0;
+        box-shadow: none;
+        -webkit-backdrop-filter: none;
+        backdrop-filter: none;
+      }
+      .tn-footer.tn-footer--suite-embed .tn-body {
+        width: 100%;
+        min-width: 0;
+      }
     `);
   }
 }
