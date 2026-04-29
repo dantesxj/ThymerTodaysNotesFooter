@@ -6,7 +6,7 @@
 
 
 
-// @generated BEGIN thymer-plugin-settings (source: plugins/plugin-settings/ThymerPluginSettingsRuntime.js — run: npm run embed-plugin-settings)
+// @generated BEGIN thymer-plugin-settings (source: plugins/public repo/plugin-settings/ThymerPluginSettingsRuntime.js — run: npm run embed-plugin-settings)
 /**
  * ThymerPluginSettings — workspace **Plugin Backend** collection + optional localStorage mirror
  * for global plugins that do not own a collection. (Legacy name **Plugin Settings** is still found until renamed.)
@@ -618,7 +618,7 @@
               console.error(
                 '[ThymerPluginSettings] saveConfiguration succeeded but "plugin" field is still type',
                 pf.type,
-                '— check collection General tab or re-import plugins/plugin-settings/Plugin Backend.json.'
+                '— check collection General tab or re-import plugins/public repo/plugin-settings/Plugin Backend.json.'
               );
             }
           } catch (_) {}
@@ -1676,7 +1676,15 @@
     dateFields: ["When", "when"],      // property names to check for date matching
     excludedCollections: ["Archives"], // collection names to hide
     panelLabel: "", // empty = default "Today's Notes"
-    timeMachine: { enabled: true, filters: [{ field: "When", op: "same_day_last_year", value: "" }] }
+    mainSortMode: "collection",       // "collection" | "chrono" — default for new journal days / footer expand
+    chronoShowCollectionIcon: true,
+    chronoShowCollectionName: true,
+    timeMachine: {
+      enabled: true,
+      filters: [{ field: "When", op: "same_day_last_year", value: "" }],
+      excludeJournalYearForMonthDay: true, // for "same month/day as journal", omit the journal year (avoids duplicating Today's Notes)
+      groupWithinYear: "collection"       // "collection" | "chrono" — after year headings in Time Machine
+    }
   }
 */
 
@@ -1784,6 +1792,8 @@ class Plugin extends AppPlugin {
     return {
       enabled: true,
       filters: [{ id: 'tm_default', field: 'When', op: 'same_day_last_year', value: '' }],
+      excludeJournalYearForMonthDay: true,
+      groupWithinYear: 'collection',
     };
   }
 
@@ -1799,7 +1809,10 @@ class Plugin extends AppPlugin {
         value: f?.value != null ? String(f.value) : '',
       }))
       : base.filters;
-    return { enabled, filters };
+    const excludeJournalYearForMonthDay = tm.excludeJournalYearForMonthDay !== false;
+    const g = String(tm.groupWithinYear || '').trim().toLowerCase();
+    const groupWithinYear = g === 'chrono' ? 'chrono' : 'collection';
+    return { enabled, filters, excludeJournalYearForMonthDay, groupWithinYear };
   }
 
   _loadSettings() {
@@ -1807,15 +1820,27 @@ class Plugin extends AppPlugin {
       const raw = localStorage.getItem(TN_SETTINGS_KEY);
       if (raw) {
         const parsed = JSON.parse(raw);
+        const msm = String(parsed.mainSortMode || '').trim().toLowerCase();
         return {
           panelLabel:          typeof parsed.panelLabel === 'string' ? parsed.panelLabel : '',
           dateFields:          Array.isArray(parsed.dateFields)          ? parsed.dateFields          : ['When', 'when'],
           excludedCollections: Array.isArray(parsed.excludedCollections) ? parsed.excludedCollections : [],
+          mainSortMode:        msm === 'chrono' ? 'chrono' : 'collection',
+          chronoShowCollectionIcon: parsed.chronoShowCollectionIcon !== false,
+          chronoShowCollectionName: parsed.chronoShowCollectionName !== false,
           timeMachine:         this._normalizeTimeMachine(parsed.timeMachine),
         };
       }
     } catch (_) {}
-    return { panelLabel: '', dateFields: ['When', 'when'], excludedCollections: [], timeMachine: this._defaultTimeMachine() };
+    return {
+      panelLabel: '',
+      dateFields: ['When', 'when'],
+      excludedCollections: [],
+      mainSortMode: 'collection',
+      chronoShowCollectionIcon: true,
+      chronoShowCollectionName: true,
+      timeMachine: this._defaultTimeMachine(),
+    };
   }
 
   _saveSettings() {
@@ -1831,7 +1856,79 @@ class Plugin extends AppPlugin {
     const f = fields.map((x) => String(x || '').trim().toLowerCase()).filter(Boolean).sort();
     const e = excluded.map((x) => String(x || '').trim().toLowerCase()).filter(Boolean).sort();
     const tm = this._normalizeTimeMachine(this._settings?.timeMachine);
-    return JSON.stringify({ pl, f, e, tm });
+    const msm = this._settings?.mainSortMode === 'chrono' ? 'chrono' : 'collection';
+    const ci = this._settings?.chronoShowCollectionIcon !== false;
+    const cn = this._settings?.chronoShowCollectionName !== false;
+    return JSON.stringify({ pl, f, e, tm, msm, ci, cn });
+  }
+
+  _mainSortMode() {
+    return this._settings?.mainSortMode === 'chrono' ? 'chrono' : 'collection';
+  }
+
+  /** `activeMain`: 'collection' | 'chrono' | null. Initialize once from settings when still undefined. */
+  _ensureDefaultActiveMain(state) {
+    if (!state || state.activeMain !== undefined) return;
+    try { delete state._sectionCollapsed?.['main:chrono']; } catch (_) {}
+    state.activeMain = this._mainSortMode() === 'chrono' ? 'chrono' : 'collection';
+  }
+
+  /**
+   * How the main list is shown for this panel (footer menu / clock toggles).
+   * @returns {'chrono' | 'collection' | 'main_collapsed'}
+   */
+  _effectiveMainPresentation(state) {
+    this._ensureDefaultActiveMain(state);
+    if (state.activeMain === 'chrono') return 'chrono';
+    if (state.activeMain === 'collection') return 'collection';
+    return 'main_collapsed';
+  }
+
+  _triMainAndTmAllOff(state) {
+    if (!state) return false;
+    const mainOff = state.activeMain == null;
+    const tmOff = !this._timeMachineEnabled() || !!state._sectionCollapsed?.[TN_TM_SECTION_KEY];
+    return mainOff && tmOff;
+  }
+
+  /** When menu, clock, and Time Machine are all off, collapse the whole Today's Notes footer (non-suite). */
+  _maybeCollapseEntireFooterIfTriAllOff(state) {
+    if (!this._triMainAndTmAllOff(state)) return;
+    if (this._tnJournalFooterSuiteEmbed) return;
+    this._collapsed = true;
+    this._saveBool('tn_footer_collapsed', this._collapsed);
+    const root = state?.rootEl;
+    if (root?.isConnected) {
+      const body = root.querySelector('[data-role="body"]');
+      const tgl = root.querySelector('.tn-toggle');
+      if (body) body.style.display = 'none';
+      if (tgl) tgl.textContent = '+';
+    }
+  }
+
+  _resortMainResultsForPresentation(results, presentation) {
+    const arr = Array.isArray(results) ? results.map((x) => ({ ...x })) : [];
+    if (presentation === 'chrono') {
+      arr.sort((a, b) => {
+        const ta = a.dateVal instanceof Date && !Number.isNaN(a.dateVal.getTime()) ? a.dateVal.getTime() : 0;
+        const tb = b.dateVal instanceof Date && !Number.isNaN(b.dateVal.getTime()) ? b.dateVal.getTime() : 0;
+        if (ta !== tb) return ta - tb;
+        return String(a.collectionName || '').localeCompare(String(b.collectionName || ''));
+      });
+    } else {
+      arr.sort((a, b) => {
+        const c = a.collectionName.localeCompare(b.collectionName);
+        return c !== 0 ? c : a.dateVal - b.dateVal;
+      });
+    }
+    return arr;
+  }
+
+  _chronoRowMeta() {
+    return {
+      showCollectionIcon: this._settings?.chronoShowCollectionIcon !== false,
+      showCollectionName: this._settings?.chronoShowCollectionName !== false,
+    };
   }
 
   _panelTitleText() {
@@ -1928,6 +2025,9 @@ class Plugin extends AppPlugin {
       panelLabel:          this._settings.panelLabel != null ? String(this._settings.panelLabel) : '',
       dateFields:          [...this._settings.dateFields],
       excludedCollections: new Set(this._settings.excludedCollections),
+      mainSortMode:        this._settings.mainSortMode === 'chrono' ? 'chrono' : 'collection',
+      chronoShowCollectionIcon: this._settings.chronoShowCollectionIcon !== false,
+      chronoShowCollectionName: this._settings.chronoShowCollectionName !== false,
       timeMachine:         JSON.parse(JSON.stringify(this._normalizeTimeMachine(this._settings.timeMachine))),
     };
 
@@ -2001,6 +2101,55 @@ class Plugin extends AppPlugin {
         collSec.appendChild(row);
       });
       wrap.appendChild(collSec);
+
+      // ── Display / grouping ──────────────────────────────────────────────
+      const dispSec = document.createElement('div');
+      dispSec.appendChild(this._cfgLabel('Display',
+        'How to order notes that match the journal day. Collection grouping is unchanged from before when you pick "By collection".'));
+
+      const sortLab = document.createElement('label');
+      sortLab.style.cssText = 'display:block;font-size:12px;color:var(--text-muted,#8a7e6a);margin-bottom:6px;';
+      sortLab.textContent = 'Order notes';
+      dispSec.appendChild(sortLab);
+
+      const sortSel = document.createElement('select');
+      sortSel.style.cssText = 'width:100%;padding:7px 10px;border-radius:6px;font-size:13px;background:var(--bg-default,#18181b);color:inherit;border:1px solid var(--border-default,#3f3f46);margin-bottom:10px;';
+      [['collection', 'By collection (default)'], ['chrono', 'By time (chronological within the day)']].forEach(([val, lab]) => {
+        const o = document.createElement('option');
+        o.value = val;
+        o.textContent = lab;
+        sortSel.appendChild(o);
+      });
+      sortSel.value = s.mainSortMode === 'chrono' ? 'chrono' : 'collection';
+      sortSel.addEventListener('change', () => { s.mainSortMode = sortSel.value === 'chrono' ? 'chrono' : 'collection'; render(); });
+      dispSec.appendChild(sortSel);
+
+      const chronoOpts = document.createElement('div');
+      chronoOpts.style.cssText = 'display:flex;flex-direction:column;gap:8px;padding:10px 0 4px;border-top:1px solid rgba(255,255,255,0.06);';
+      const showWhenChrono = s.mainSortMode === 'chrono';
+      chronoOpts.style.display = showWhenChrono ? 'flex' : 'none';
+
+      const mkChronoCb = (label, key) => {
+        const lb = document.createElement('label');
+        lb.style.cssText = 'display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px;';
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.checked = s[key] !== false;
+        cb.style.cssText = 'width:15px;height:15px;cursor:pointer;accent-color:var(--color-primary-500,#a78bfa);';
+        cb.addEventListener('change', () => { s[key] = cb.checked; });
+        const sp = document.createElement('span');
+        sp.textContent = label;
+        lb.appendChild(cb);
+        lb.appendChild(sp);
+        return lb;
+      };
+      chronoOpts.appendChild(this._cfgLabel('When sorted by time',
+        'Show where each note lives without switching back to collection groups.'));
+      chronoOpts.appendChild(mkChronoCb('Show collection icon', 'chronoShowCollectionIcon'));
+      chronoOpts.appendChild(mkChronoCb('Show collection name', 'chronoShowCollectionName'));
+      dispSec.appendChild(chronoOpts);
+
+      wrap.appendChild(dispSec);
 
       // ── Time Machine ───────────────────────────────────────────────────
       const tmSec = document.createElement('div');
@@ -2088,6 +2237,40 @@ class Plugin extends AppPlugin {
       });
       tmSec.appendChild(tmFiltersWrap);
       tmSec.appendChild(addTmFilter);
+
+      const tmExtra = document.createElement('div');
+      tmExtra.style.cssText = 'display:flex;flex-direction:column;gap:10px;margin-top:14px;padding-top:14px;border-top:1px solid rgba(255,255,255,0.06);';
+      tmExtra.appendChild(this._cfgLabel('Same month/day as journal',
+        'Skip the journal year for that filter so notes already listed in Today\'s Notes do not repeat here (on by default).'));
+
+      const exclLb = document.createElement('label');
+      exclLb.style.cssText = 'display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px;';
+      const exclCb = document.createElement('input');
+      exclCb.type = 'checkbox';
+      exclCb.checked = s.timeMachine.excludeJournalYearForMonthDay !== false;
+      exclCb.style.cssText = 'width:15px;height:15px;cursor:pointer;accent-color:var(--color-primary-500,#a78bfa);';
+      exclCb.addEventListener('change', () => { s.timeMachine.excludeJournalYearForMonthDay = exclCb.checked; });
+      const exclSp = document.createElement('span');
+      exclSp.textContent = 'Exclude journal calendar year from "same month/day" results';
+      exclLb.appendChild(exclCb);
+      exclLb.appendChild(exclSp);
+      tmExtra.appendChild(exclLb);
+
+      tmExtra.appendChild(this._cfgLabel('Inside Time Machine',
+        'Results are grouped by year. Choose how to order notes within each year (same choices as above).'));
+      const tmGroupSel = document.createElement('select');
+      tmGroupSel.style.cssText = 'width:100%;padding:7px 10px;border-radius:6px;font-size:13px;background:var(--bg-default,#18181b);color:inherit;border:1px solid var(--border-default,#3f3f46);';
+      [['collection', 'By collection'], ['chrono', 'By time']].forEach(([val, lab]) => {
+        const o = document.createElement('option');
+        o.value = val;
+        o.textContent = lab;
+        tmGroupSel.appendChild(o);
+      });
+      tmGroupSel.value = s.timeMachine.groupWithinYear === 'chrono' ? 'chrono' : 'collection';
+      tmGroupSel.addEventListener('change', () => { s.timeMachine.groupWithinYear = tmGroupSel.value === 'chrono' ? 'chrono' : 'collection'; });
+      tmExtra.appendChild(tmGroupSel);
+
+      tmSec.appendChild(tmExtra);
       wrap.appendChild(tmSec);
 
       if (!suiteEmbed) {
@@ -2108,6 +2291,9 @@ class Plugin extends AppPlugin {
         panelLabel:          String(s.panelLabel || '').trim(),
         dateFields:          s.dateFields.filter(f => f.trim()),
         excludedCollections: Array.from(s.excludedCollections),
+        mainSortMode:        s.mainSortMode === 'chrono' ? 'chrono' : 'collection',
+        chronoShowCollectionIcon: s.chronoShowCollectionIcon !== false,
+        chronoShowCollectionName: s.chronoShowCollectionName !== false,
         timeMachine:         this._normalizeTimeMachine(s.timeMachine),
       };
       this._saveSettings();
@@ -2230,6 +2416,8 @@ class Plugin extends AppPlugin {
         state._sectionCollapsed = {};
         state.timeMachineResults = null;
         state.timeMachineLoading = false;
+        state.activeMain = this._mainSortMode() === 'chrono' ? 'chrono' : 'collection';
+        state._sectionCollapsed[TN_TM_SECTION_KEY] = true;
       }
     }
 
@@ -2361,51 +2549,179 @@ class Plugin extends AppPlugin {
 
   _allInnerTnSectionsCollapsed(state) {
     if (!state) return false;
-    const byColl = this._groupResultsByCollection(state._lastMainResults || []);
-    for (const name of byColl.keys()) {
-      const sk = this._collectionSectionKey(name);
-      if (!(sk in state._sectionCollapsed)) state._sectionCollapsed[sk] = false;
-      if (!state._sectionCollapsed[sk]) return false;
+    const main = state._lastMainResults || [];
+    const pres = this._effectiveMainPresentation(state);
+    if (pres === 'main_collapsed' && main.length > 0) {
+      /* main list intentionally hidden */
+    } else if (pres === 'chrono' && main.length > 0) {
+      return false;
+    } else {
+      const byColl = this._groupResultsByCollection(main);
+      for (const name of byColl.keys()) {
+        const sk = this._collectionSectionKey(name);
+        if (!(sk in state._sectionCollapsed)) state._sectionCollapsed[sk] = false;
+        if (!state._sectionCollapsed[sk]) return false;
+      }
     }
     if (this._timeMachineEnabled()) {
-      if (!(TN_TM_SECTION_KEY in state._sectionCollapsed)) state._sectionCollapsed[TN_TM_SECTION_KEY] = false;
+      if (!(TN_TM_SECTION_KEY in state._sectionCollapsed)) state._sectionCollapsed[TN_TM_SECTION_KEY] = true;
       if (!state._sectionCollapsed[TN_TM_SECTION_KEY]) return false;
     }
-    return byColl.size > 0 || this._timeMachineEnabled();
+    const byCollEnd = this._groupResultsByCollection(main);
+    const hasMain =
+      (pres === 'main_collapsed' && main.length > 0) ||
+      (pres === 'chrono' && main.length > 0) ||
+      byCollEnd.size > 0;
+    return hasMain || this._timeMachineEnabled();
   }
 
   _expandAllTnSections(state) {
     if (!state) return;
-    const byColl = this._groupResultsByCollection(state._lastMainResults || []);
+    const main = state._lastMainResults || [];
+    state.activeMain = this._mainSortMode() === 'chrono' ? 'chrono' : 'collection';
+    const byColl = this._groupResultsByCollection(main);
     for (const name of byColl.keys()) {
       state._sectionCollapsed[this._collectionSectionKey(name)] = false;
     }
     if (this._timeMachineEnabled()) state._sectionCollapsed[TN_TM_SECTION_KEY] = false;
   }
 
-  /** Ensure `.jfs-tn-extras` in the Journal Footer shell has wrap + TM control (suite embed only). */
+  /** Ensure `.jfs-tn-extras` has collapsed chips + tri icon row (suite embed only). */
   _ensureJfsTnExtrasShell(state, host) {
-    if (!host || host.querySelector('.tn-tm-header-btn')) return;
+    if (!host) return;
+    if (!host.querySelector('.tn-collapsed-sections-wrap')) {
+      const wrap = document.createElement('span');
+      wrap.className = 'tn-collapsed-sections-wrap';
+      host.appendChild(wrap);
+    }
+    if (!host.querySelector('.tn-header-tri')) {
+      const tri = this._createTriHeaderRow(state);
+      host.appendChild(tri);
+    }
+  }
+
+  _createTriHeaderRow(state) {
     const wrap = document.createElement('span');
-    wrap.className = 'tn-collapsed-sections-wrap';
-    const tmHeaderBtn = document.createElement('button');
-    tmHeaderBtn.type = 'button';
-    tmHeaderBtn.className = 'tn-tm-header-btn button-none button-small button-minimal-hover';
-    tmHeaderBtn.title = 'Expand Time Machine and run query';
-    tmHeaderBtn.style.display = 'none';
-    tmHeaderBtn.setAttribute('aria-label', 'Expand Time Machine and run query');
-    this._appendTmGenerateIcon(tmHeaderBtn, 18);
-    tmHeaderBtn.addEventListener('click', (e) => {
+    wrap.className = 'tn-header-tri';
+
+    const mk = (cls, icon, title) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = `${cls} button-none button-small button-minimal-hover`;
+      b.title = title;
+      b.setAttribute('aria-label', title);
+      try {
+        b.appendChild(this.ui.createIcon(icon));
+      } catch (_) {
+        b.textContent = '?';
+      }
+      return b;
+    };
+
+    const menuBtn = document.createElement('button');
+    menuBtn.type = 'button';
+    menuBtn.className = 'tn-tri-menu button-none button-small button-minimal-hover';
+    menuBtn.title = 'By collection';
+    menuBtn.setAttribute('aria-label', 'By collection');
+    this._appendByCollectionModeIcon(menuBtn);
+    menuBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (state.activeMain === 'collection') state.activeMain = null;
+      else state.activeMain = 'collection';
+      this._maybeCollapseEntireFooterIfTriAllOff(state);
+      this._renderFooterBody(state);
+      this._syncTnHeaderExtras(state);
+    });
+
+    const clockBtn = mk('tn-tri-clock', 'ti-clock', 'By time');
+    clockBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (state.activeMain === 'chrono') state.activeMain = null;
+      else state.activeMain = 'chrono';
+      this._maybeCollapseEntireFooterIfTriAllOff(state);
+      this._renderFooterBody(state);
+      this._syncTnHeaderExtras(state);
+    });
+
+    const tmBtn = document.createElement('button');
+    tmBtn.type = 'button';
+    tmBtn.className = 'tn-tri-tm button-none button-small button-minimal-hover';
+    tmBtn.title = 'Time Machine';
+    tmBtn.setAttribute('aria-label', 'Time Machine');
+    this._appendTmGenerateIcon(tmBtn, 18);
+    tmBtn.addEventListener('click', (e) => {
       e.preventDefault();
       e.stopPropagation();
       if (!this._timeMachineEnabled()) return;
-      state._sectionCollapsed[TN_TM_SECTION_KEY] = false;
+      const cur = !!state._sectionCollapsed?.[TN_TM_SECTION_KEY];
+      state._sectionCollapsed[TN_TM_SECTION_KEY] = !cur;
+      if (!state._sectionCollapsed[TN_TM_SECTION_KEY]) {
+        void this._runTimeMachineGenerate(state);
+      } else {
+        this._maybeCollapseEntireFooterIfTriAllOff(state);
+      }
       this._renderFooterBody(state);
       this._syncTnHeaderExtras(state);
-      void this._runTimeMachineGenerate(state);
     });
-    host.appendChild(wrap);
-    host.appendChild(tmHeaderBtn);
+
+    const triDivider = document.createElement('span');
+    triDivider.className = 'tn-header-tri-divider';
+    triDivider.setAttribute('aria-hidden', 'true');
+
+    wrap.appendChild(menuBtn);
+    wrap.appendChild(clockBtn);
+    wrap.appendChild(triDivider);
+    wrap.appendChild(tmBtn);
+    return wrap;
+  }
+
+  _syncTriHeaderRow(state, tnRoot, footCollapsed) {
+    const row =
+      tnRoot?.querySelector?.('.tn-header-tri') ||
+      tnRoot?.closest?.('.jfs-shell')?.querySelector?.('.jfs-tn-extras .tn-header-tri');
+    if (!row) return;
+    if (footCollapsed) {
+      row.style.display = 'none';
+      return;
+    }
+    row.style.display = 'inline-flex';
+    this._ensureDefaultActiveMain(state);
+
+    const menuBtn = row.querySelector('.tn-tri-menu');
+    const clockBtn = row.querySelector('.tn-tri-clock');
+    const tmBtn = row.querySelector('.tn-tri-tm');
+    if (menuBtn) {
+      const on = state.activeMain === 'collection';
+      menuBtn.classList.toggle('tn-tri-lit', on);
+      menuBtn.classList.toggle('tn-tri-dim', !on);
+      menuBtn.title = on ? 'By collection (click to hide)' : 'By collection (click to show)';
+    }
+    if (clockBtn) {
+      const on = state.activeMain === 'chrono';
+      clockBtn.classList.toggle('tn-tri-lit', on);
+      clockBtn.classList.toggle('tn-tri-dim', !on);
+      clockBtn.title = on ? 'By time (click to hide)' : 'By time (click to show)';
+    }
+    if (tmBtn) {
+      if (!this._timeMachineEnabled()) {
+        tmBtn.disabled = true;
+        tmBtn.style.opacity = '0.35';
+        tmBtn.style.pointerEvents = 'none';
+        tmBtn.classList.remove('tn-tri-lit', 'tn-tri-dim');
+        tmBtn.title = 'Time Machine disabled in settings';
+      } else {
+        tmBtn.disabled = false;
+        tmBtn.style.opacity = '';
+        tmBtn.style.pointerEvents = '';
+        const tmCollapsed = !!state._sectionCollapsed?.[TN_TM_SECTION_KEY];
+        const on = !tmCollapsed;
+        tmBtn.classList.toggle('tn-tri-lit', on);
+        tmBtn.classList.toggle('tn-tri-dim', !on);
+        tmBtn.title = on ? 'Time Machine (click to hide)' : 'Time Machine (click to show)';
+      }
+    }
   }
 
   _syncTnHeaderExtras(state) {
@@ -2413,7 +2729,6 @@ class Plugin extends AppPlugin {
     if (!tnRoot) return;
     const footCollapsed = this._tnJournalFooterSuiteEmbed ? false : this._collapsed;
 
-    let tmBtn;
     let wrap;
     /** @type {HTMLElement | null} */
     let jfsHost = null;
@@ -2422,31 +2737,20 @@ class Plugin extends AppPlugin {
       jfsHost = tnRoot.closest?.('.jfs-shell')?.querySelector?.('.jfs-tn-extras');
       if (!jfsHost) return;
       this._ensureJfsTnExtrasShell(state, jfsHost);
-      tmBtn = jfsHost.querySelector('.tn-tm-header-btn');
       wrap = jfsHost.querySelector('.tn-collapsed-sections-wrap');
     } else {
-      tmBtn = tnRoot.querySelector('.tn-tm-header-btn');
       wrap = tnRoot.querySelector('.tn-collapsed-sections-wrap');
     }
 
     if (!wrap) return;
 
-    let tmHeaderVisible = false;
-    if (tmBtn) {
-      if (!this._timeMachineEnabled()) {
-        tmBtn.style.display = 'none';
-      } else {
-        const tmCollapsed = !!state._sectionCollapsed?.[TN_TM_SECTION_KEY];
-        tmBtn.style.display = tmCollapsed && !footCollapsed ? '' : 'none';
-        tmHeaderVisible = tmBtn.style.display !== 'none';
-        tmBtn.title = 'Expand Time Machine and run query';
-      }
-    }
+    this._syncTriHeaderRow(state, tnRoot, footCollapsed);
 
     wrap.innerHTML = '';
     if (footCollapsed) return;
 
-    const byColl = this._groupResultsByCollection(state._lastMainResults || []);
+    const mainRes = state._lastMainResults || [];
+    const byColl = this._groupResultsByCollection(mainRes);
     for (const collName of byColl.keys()) {
       const sk = this._collectionSectionKey(collName);
       if (!state._sectionCollapsed?.[sk]) continue;
@@ -2459,13 +2763,14 @@ class Plugin extends AppPlugin {
       iconWrap.className = 'tn-collapsed-chip-icon';
       const rawIcon = (state._lastCollectionIcons && state._lastCollectionIcons[collName]) || '';
       if (!this._appendCollectionIconVisual(iconWrap, rawIcon)) {
-        try { iconWrap.appendChild(this.ui.createIcon('ti-folder')); } catch (_) { iconWrap.textContent = '📁'; }
+        this._appendByCollectionModeIcon(iconWrap);
       }
       btn.appendChild(iconWrap);
       btn.addEventListener('click', (ev) => {
         ev.preventDefault();
         ev.stopPropagation();
         state._sectionCollapsed[sk] = false;
+        state.activeMain = 'collection';
         if (this._collapsed && !this._tnJournalFooterSuiteEmbed) {
           this._collapsed = false;
           this._saveBool('tn_footer_collapsed', this._collapsed);
@@ -2481,11 +2786,11 @@ class Plugin extends AppPlugin {
     }
 
     if (jfsHost) {
+      const tri = jfsHost.querySelector('.tn-header-tri');
+      const triVisible = tri && tri.style.display !== 'none';
       const hasChips = wrap.childElementCount > 0;
-      jfsHost.style.display = hasChips || tmHeaderVisible ? 'flex' : 'none';
+      jfsHost.style.display = hasChips || triVisible ? 'flex' : 'none';
     }
-
-    // Time Machine when collapsed uses `.tn-tm-header-btn` only (avoid duplicate header icons).
   }
 
   _groupResultsByCollection(results) {
@@ -2496,6 +2801,40 @@ class Plugin extends AppPlugin {
       m.get(n).push(item);
     }
     return m;
+  }
+
+  _tmItemYear(item) {
+    const d =
+      item.dateVal instanceof Date && !Number.isNaN(item.dateVal.getTime())
+        ? item.dateVal
+        : this._coerceDateForTm(item.dateVal);
+    if (!d || Number.isNaN(d.getTime())) return null;
+    return d.getFullYear();
+  }
+
+  /** Split Time Machine hits into calendar years (descending order list) plus unknown-date bucket. */
+  _groupTmResultsByYearDescending(items) {
+    const yearMap = new Map();
+    const unknown = [];
+    for (const it of items || []) {
+      const y = this._tmItemYear(it);
+      if (y == null || Number.isNaN(y)) {
+        unknown.push(it);
+        continue;
+      }
+      if (!yearMap.has(y)) yearMap.set(y, []);
+      yearMap.get(y).push(it);
+    }
+    const years = Array.from(yearMap.keys()).sort((a, b) => b - a);
+    return { yearMap, years, unknown };
+  }
+
+  _sortTmItemsByTimeAscending(items) {
+    return [...(items || [])].sort((a, b) => {
+      const ta = a.dateVal instanceof Date && !Number.isNaN(a.dateVal.getTime()) ? a.dateVal.getTime() : 0;
+      const tb = b.dateVal instanceof Date && !Number.isNaN(b.dateVal.getTime()) ? b.dateVal.getTime() : 0;
+      return ta - tb;
+    });
   }
 
   _createIconNode(iconNames) {
@@ -2578,25 +2917,44 @@ class Plugin extends AppPlugin {
     return '';
   }
 
+  /**
+   * "By collection" header glyph. `ti-menu-alt` is often missing from Thymer's bundled Tabler set;
+   * try known slugs then raw `ti ti-*` so the webfont still renders when `createIcon` returns null.
+   */
+  _appendByCollectionModeIcon(parent) {
+    if (!parent) return;
+    const candidates = ['ti-layout-list', 'ti-menu-2', 'ti-list', 'ti-align-justified', 'ti-folder'];
+    const node = this._createIconNode(candidates);
+    if (node) {
+      parent.appendChild(node);
+      return;
+    }
+    const slugs = ['layout-list', 'menu-2', 'list', 'folder'];
+    for (const slug of slugs) {
+      const i = document.createElement('i');
+      i.className = `ti ti-${slug}`;
+      i.setAttribute('aria-hidden', 'true');
+      parent.appendChild(i);
+      return;
+    }
+    const span = document.createElement('span');
+    span.textContent = '☰';
+    span.setAttribute('aria-hidden', 'true');
+    parent.appendChild(span);
+  }
+
+  /** Time Machine header control — hourglass in both collapsed and expanded states (matches section icon). */
   _appendTmGenerateIcon(btn, size = 18) {
     if (!btn) return;
     btn.innerHTML = '';
-    const n = Math.max(12, Math.min(32, Number(size) || 18));
-    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-    svg.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
-    svg.setAttribute('width', String(n));
-    svg.setAttribute('height', String(n));
-    svg.setAttribute('viewBox', '0 0 24 24');
-    svg.setAttribute('fill', 'none');
-    svg.setAttribute('stroke', 'currentColor');
-    svg.setAttribute('stroke-width', n <= 18 ? '1.75' : '1.65');
-    svg.setAttribute('aria-hidden', 'true');
-    const p = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-    p.setAttribute('stroke-linecap', 'round');
-    p.setAttribute('stroke-linejoin', 'round');
-    p.setAttribute('d', 'M12 8v4l3 2M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0z');
-    svg.appendChild(p);
-    btn.appendChild(svg);
+    try {
+      const node = this.ui.createIcon('ti-hourglass');
+      if (node) {
+        btn.appendChild(node);
+        return;
+      }
+    } catch (_) {}
+    btn.textContent = '⏳';
   }
 
   _journalDateParts(yyyymmdd) {
@@ -2719,7 +3077,10 @@ class Plugin extends AppPlugin {
     if (op === 'same_month_day_as_journal') {
       const d = this._coerceDateForTm(raw);
       if (!d) return false;
-      return d.getMonth() + 1 === journalParts.month && d.getDate() === journalParts.day;
+      if (d.getMonth() + 1 !== journalParts.month || d.getDate() !== journalParts.day) return false;
+      const tmCfg = this._normalizeTimeMachine(this._settings?.timeMachine);
+      if (tmCfg.excludeJournalYearForMonthDay !== false && d.getFullYear() === journalParts.year) return false;
+      return true;
     }
     if (op === 'on_journal_day') {
       const d = this._coerceDateForTm(raw);
@@ -2812,7 +3173,12 @@ class Plugin extends AppPlugin {
     const bodyEl = targetRootEl.querySelector('[data-role="body"]');
     if (!bodyEl) return;
     const countEl = targetRootEl.querySelector('[data-role="count"]');
-    const results = state._lastMainResults || [];
+    const raw = state._lastMainResults || [];
+    const pres = this._effectiveMainPresentation(state);
+    const results =
+      !raw.length || pres === 'main_collapsed'
+        ? raw
+        : this._resortMainResultsForPresentation(raw.map((x) => ({ ...x })), pres);
     bodyEl.innerHTML = '';
 
     if (this._collapsed && !this._tnJournalFooterSuiteEmbed) {
@@ -2820,35 +3186,45 @@ class Plugin extends AppPlugin {
       return;
     }
 
-    if (!results.length) {
+    if (!raw.length) {
       if (countEl) countEl.textContent = '';
       if (!this._timeMachineEnabled()) {
         bodyEl.innerHTML = '<div class="tn-empty">No notes found for this day.</div>';
       }
     } else {
-      if (countEl) countEl.textContent = String(results.length);
-      const byColl = this._groupResultsByCollection(results);
-      for (const [collName, items] of byColl) {
-        const sk = this._collectionSectionKey(collName);
-        if (!(sk in state._sectionCollapsed)) state._sectionCollapsed[sk] = false;
-        if (state._sectionCollapsed[sk]) continue;
-        const icon = (state._lastCollectionIcons && state._lastCollectionIcons[collName]) || '';
-        bodyEl.appendChild(this._buildCollectionSectionEl(collName, items, icon, sk, state));
+      if (countEl) countEl.textContent = String(raw.length);
+      if (pres === 'main_collapsed') {
+        /* notes hidden via footer cycle; header count unchanged */
+      } else if (pres === 'chrono') {
+        const list = document.createElement('div');
+        list.className = 'tn-chrono-body';
+        const rowMeta = this._chronoRowMeta();
+        for (const item of results) list.appendChild(this._buildRow(item, state, rowMeta));
+        bodyEl.appendChild(list);
+      } else {
+        const byColl = this._groupResultsByCollection(results);
+        for (const [collName, items] of byColl) {
+          const sk = this._collectionSectionKey(collName);
+          if (!(sk in state._sectionCollapsed)) state._sectionCollapsed[sk] = false;
+          if (state._sectionCollapsed[sk]) continue;
+          const icon = (state._lastCollectionIcons && state._lastCollectionIcons[collName]) || '';
+          bodyEl.appendChild(this._buildCollectionSectionEl(collName, items, icon, sk, state));
+        }
       }
     }
 
     if (this._timeMachineEnabled()) {
-      if (!(TN_TM_SECTION_KEY in state._sectionCollapsed)) state._sectionCollapsed[TN_TM_SECTION_KEY] = false;
+      if (!(TN_TM_SECTION_KEY in state._sectionCollapsed)) state._sectionCollapsed[TN_TM_SECTION_KEY] = true;
       if (!state._sectionCollapsed[TN_TM_SECTION_KEY]) {
         bodyEl.appendChild(this._buildTimeMachineSectionEl(state));
       }
     }
 
     const hasCollapsed = Object.keys(state._sectionCollapsed || {}).some((k) => state._sectionCollapsed[k]);
-    const hasMain = results.length > 0;
-    if (!hasMain && bodyEl.children.length === 0 && !hasCollapsed && !this._timeMachineEnabled()) {
+    const hasMainNotes = raw.length > 0;
+    if (!hasMainNotes && bodyEl.children.length === 0 && !hasCollapsed && !this._timeMachineEnabled()) {
       bodyEl.innerHTML = '<div class="tn-empty">No notes found for this day.</div>';
-    } else if (!hasMain && bodyEl.children.length === 0 && hasCollapsed && !this._timeMachineEnabled()) {
+    } else if (!hasMainNotes && bodyEl.children.length === 0 && hasCollapsed && !this._timeMachineEnabled()) {
       bodyEl.innerHTML = '';
     }
     this._syncTnHeaderExtras(state);
@@ -2867,7 +3243,7 @@ class Plugin extends AppPlugin {
     const iconWrap = document.createElement('span');
     iconWrap.className = 'tn-section-icon';
     if (!this._appendCollectionIconVisual(iconWrap, rawIcon)) {
-      try { iconWrap.appendChild(this.ui.createIcon('ti-folder')); } catch (_) { iconWrap.textContent = '📁'; }
+      this._appendByCollectionModeIcon(iconWrap);
     }
 
     const title = document.createElement('div');
@@ -2961,14 +3337,38 @@ class Plugin extends AppPlugin {
       return wrap;
     }
 
-    const byColl = this._groupResultsByCollection(state.timeMachineResults);
-    for (const [collName, items] of byColl) {
-      const subLabel = document.createElement('div');
-      subLabel.className = 'tn-tm-subcoll';
-      subLabel.textContent = collName;
-      body.appendChild(subLabel);
-      for (const item of items) body.appendChild(this._buildRow(item, state));
-    }
+    const tmCfg = this._normalizeTimeMachine(this._settings?.timeMachine);
+    const rowMeta = this._chronoRowMeta();
+    const { yearMap, years, unknown } = this._groupTmResultsByYearDescending(state.timeMachineResults);
+
+    const renderYearBucket = (yearLabel, items) => {
+      const yearHead = document.createElement('div');
+      yearHead.className = 'tn-tm-year-head';
+      yearHead.textContent = yearLabel;
+      body.appendChild(yearHead);
+
+      if (tmCfg.groupWithinYear === 'chrono') {
+        for (const item of this._sortTmItemsByTimeAscending(items)) {
+          body.appendChild(this._buildRow(item, state, rowMeta));
+        }
+        return;
+      }
+      const byColl = this._groupResultsByCollection(items);
+      const collNames = Array.from(byColl.keys()).sort((a, b) => String(a).localeCompare(String(b)));
+      for (const collName of collNames) {
+        const subLabel = document.createElement('div');
+        subLabel.className = 'tn-tm-subcoll';
+        subLabel.textContent = collName;
+        body.appendChild(subLabel);
+        for (const item of this._sortTmItemsByTimeAscending(byColl.get(collName) || [])) {
+          body.appendChild(this._buildRow(item, state, null));
+        }
+      }
+    };
+
+    for (const y of years) renderYearBucket(String(y), yearMap.get(y) || []);
+    if (unknown.length) renderYearBucket('Other', unknown);
+
     return wrap;
   }
 
@@ -3013,30 +3413,7 @@ class Plugin extends AppPlugin {
     const collapsedSectionsWrap = document.createElement('span');
     collapsedSectionsWrap.className = 'tn-collapsed-sections-wrap';
 
-    const tmHeaderBtn = document.createElement('button');
-    tmHeaderBtn.type = 'button';
-    tmHeaderBtn.className = 'tn-tm-header-btn button-none button-small button-minimal-hover';
-    tmHeaderBtn.title = 'Expand Time Machine and run query';
-    tmHeaderBtn.style.display = 'none';
-    tmHeaderBtn.setAttribute('aria-label', 'Expand Time Machine and run query');
-    this._appendTmGenerateIcon(tmHeaderBtn, 18);
-    tmHeaderBtn.addEventListener('click', (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      if (!this._timeMachineEnabled()) return;
-      state._sectionCollapsed[TN_TM_SECTION_KEY] = false;
-      if (this._collapsed) {
-        this._collapsed = false;
-        this._saveBool('tn_footer_collapsed', this._collapsed);
-        const body = root.querySelector('[data-role="body"]');
-        const tgl = root.querySelector('.tn-toggle');
-        if (body) body.style.display = 'block';
-        if (tgl) tgl.textContent = '−';
-      }
-      this._renderFooterBody(state);
-      this._syncTnHeaderExtras(state);
-      void this._runTimeMachineGenerate(state);
-    });
+    const triHeaderRow = this._createTriHeaderRow(state);
 
     const settingsBtn = document.createElement('button');
     settingsBtn.type      = 'button';
@@ -3050,7 +3427,7 @@ class Plugin extends AppPlugin {
     header.appendChild(titleEl);
     header.appendChild(countEl);
     header.appendChild(collapsedSectionsWrap);
-    header.appendChild(tmHeaderBtn);
+    header.appendChild(triHeaderRow);
     header.appendChild(settingsBtn);
 
     const body = document.createElement('div');
@@ -3061,8 +3438,13 @@ class Plugin extends AppPlugin {
     toggle.addEventListener('click', () => {
       const wasCollapsed = this._collapsed;
       this._collapsed    = !this._collapsed;
-      if (!this._collapsed && wasCollapsed && this._allInnerTnSectionsCollapsed(state)) {
-        this._expandAllTnSections(state);
+      if (!this._collapsed && wasCollapsed) {
+        if (state.activeMain == null) {
+          state.activeMain = this._mainSortMode() === 'chrono' ? 'chrono' : 'collection';
+        }
+        if (this._allInnerTnSectionsCollapsed(state)) {
+          this._expandAllTnSections(state);
+        }
       }
       this._saveBool('tn_footer_collapsed', this._collapsed);
       toggle.textContent = this._collapsed ? '+' : '−';
@@ -3144,7 +3526,7 @@ class Plugin extends AppPlugin {
     bodyEl.innerHTML = '<div class="tn-loading">Loading…</div>';
 
     try {
-      const results = await this._getRecordsForDate(targetDate);
+      let results = await this._getRecordsForDate(targetDate);
 
       // If rootEl was rebuilt or date changed while we awaited, our results are stale — abort
       if (state.rootEl !== targetRootEl || state.journalDate !== targetDate) {
@@ -3159,6 +3541,7 @@ class Plugin extends AppPlugin {
         state.timeMachineLoading = false;
       }
 
+      results = this._resortMainResultsForPresentation(results, this._effectiveMainPresentation(state));
       state._lastMainResults = results;
       state._lastCollectionIcons = {};
       for (const item of results) {
@@ -3182,7 +3565,7 @@ class Plugin extends AppPlugin {
     if (state._pendingPopulate) { state._pendingPopulate = false; this._populate(state); }
   }
 
-  _buildRow(item, state) {
+  _buildRow(item, state, rowMeta = null) {
     const guid = item.record.guid;
 
     const groupEl = document.createElement('div');
@@ -3196,6 +3579,8 @@ class Plugin extends AppPlugin {
 
     const row = document.createElement('div');
     row.className = 'tn-row';
+
+    const meta = rowMeta || { showCollectionIcon: false, showCollectionName: false };
 
     const nameBtn = document.createElement('button');
     nameBtn.type        = 'button';
@@ -3222,6 +3607,26 @@ class Plugin extends AppPlugin {
     });
 
     row.appendChild(this._buildExpandRecordBtn(guid, state));
+    if (meta.showCollectionIcon || meta.showCollectionName) {
+      const strip = document.createElement('span');
+      strip.className = 'tn-row-coll-strip';
+      if (meta.showCollectionIcon) {
+        const iw = document.createElement('span');
+        iw.className = 'tn-row-coll-ico';
+        const ric = item.collectionIcon || '';
+        if (!this._appendCollectionIconVisual(iw, ric)) {
+          this._appendByCollectionModeIcon(iw);
+        }
+        strip.appendChild(iw);
+      }
+      if (meta.showCollectionName && String(item.collectionName || '').trim()) {
+        const nm = document.createElement('span');
+        nm.className = 'tn-row-coll-name';
+        nm.textContent = item.collectionName;
+        strip.appendChild(nm);
+      }
+      row.appendChild(strip);
+    }
     row.appendChild(nameBtn);
     row.appendChild(arrow);
     groupEl.appendChild(row);
@@ -3525,10 +3930,20 @@ class Plugin extends AppPlugin {
     );
 
     const results = perColl.flat();
-    results.sort((a, b) => {
-      const c = a.collectionName.localeCompare(b.collectionName);
-      return c !== 0 ? c : a.dateVal - b.dateVal;
-    });
+    const mode = this._mainSortMode();
+    if (mode === 'chrono') {
+      results.sort((a, b) => {
+        const ta = a.dateVal instanceof Date && !Number.isNaN(a.dateVal.getTime()) ? a.dateVal.getTime() : 0;
+        const tb = b.dateVal instanceof Date && !Number.isNaN(b.dateVal.getTime()) ? b.dateVal.getTime() : 0;
+        if (ta !== tb) return ta - tb;
+        return String(a.collectionName || '').localeCompare(String(b.collectionName || ''));
+      });
+    } else {
+      results.sort((a, b) => {
+        const c = a.collectionName.localeCompare(b.collectionName);
+        return c !== 0 ? c : a.dateVal - b.dateVal;
+      });
+    }
 
     try { this._recordsByDateCache.set(cacheKey, { ts: now, results }); } catch (_) {}
     return results;
@@ -3671,18 +4086,55 @@ class Plugin extends AppPlugin {
         justify-content: center;
         font-size: 14px;
       }
-      .tn-footer .tn-tm-header-btn {
+      .tn-footer .tn-header-tri,
+      .jfs-tn-extras .tn-header-tri {
+        display: inline-flex;
+        align-items: center;
+        gap: 2px;
+        flex-shrink: 0;
+        margin-left: 2px;
+      }
+      .tn-footer .tn-header-tri button,
+      .jfs-tn-extras .tn-header-tri button {
         display: inline-flex;
         align-items: center;
         justify-content: center;
         width: 26px;
         height: 26px;
-        color: #8a7e6a;
         flex-shrink: 0;
         padding: 0;
         line-height: 0;
+        color: #8a7e6a;
+        transition: color 0.15s ease, opacity 0.15s ease;
       }
-      .tn-footer .tn-tm-header-btn:hover { color: #e8e0d0; }
+      .tn-footer .tn-header-tri .tn-tri-lit,
+      .jfs-tn-extras .tn-header-tri .tn-tri-lit {
+        color: #e8e0d0;
+        opacity: 1;
+      }
+      .tn-footer .tn-header-tri .tn-tri-dim,
+      .jfs-tn-extras .tn-header-tri .tn-tri-dim {
+        color: #8a7e6a;
+        opacity: 0.42;
+      }
+      .tn-footer .tn-header-tri .tn-tri-dim:hover,
+      .jfs-tn-extras .tn-header-tri .tn-tri-dim:hover {
+        opacity: 0.85;
+        color: #e8e0d0;
+      }
+      .tn-footer .tn-header-tri-divider,
+      .jfs-tn-extras .tn-header-tri-divider {
+        display: inline-block;
+        width: 1px;
+        height: 14px;
+        margin: 0 5px 0 5px;
+        background: rgba(232, 224, 208, 0.2);
+        flex-shrink: 0;
+        align-self: center;
+      }
+      .tn-footer .tn-chrono-body {
+        padding-left: 2px;
+      }
       .tn-footer .tn-section {
         margin-top: 10px;
         border-top: 1px solid rgba(255,255,255,0.08);
@@ -3727,6 +4179,41 @@ class Plugin extends AppPlugin {
         letter-spacing: 0.06em;
         color: #8a7e6a;
         margin: 8px 0 4px;
+      }
+      .tn-footer .tn-tm-year-head {
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: rgba(232,224,208,0.92);
+        margin: 12px 0 6px;
+        padding-bottom: 4px;
+        border-bottom: 1px solid rgba(255,255,255,0.1);
+      }
+      .tn-footer .tn-tm-year-head:first-child { margin-top: 0; }
+      .tn-footer .tn-row-coll-strip {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        flex-shrink: 0;
+        max-width: 42%;
+      }
+      .tn-footer .tn-row-coll-ico {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        color: #8a7e6a;
+        flex-shrink: 0;
+      }
+      .tn-footer .tn-row-coll-name {
+        font-size: 10px;
+        font-weight: 700;
+        letter-spacing: 0.05em;
+        text-transform: uppercase;
+        color: #8a7e6a;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
       }
       .tn-footer .tn-collection-icon-emoji { font-size: 14px; line-height: 1; }
       .tn-footer .tn-settings-btn {
