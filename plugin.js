@@ -2317,7 +2317,8 @@ class Plugin extends AppPlugin {
 
       s.timeMachine.filters = Array.isArray(s.timeMachine.filters) ? s.timeMachine.filters : [];
       const tmFiltersWrap = document.createElement('div');
-      tmFiltersWrap.style.cssText = 'display:flex;flex-direction:column;gap:8px;border-top:1px solid rgba(255,255,255,0.08);padding-top:10px;';
+      tmFiltersWrap.style.cssText =
+        'display:flex;flex-direction:column;gap:8px;margin-top:12px;border-top:1px solid rgba(255,255,255,0.08);padding-top:12px;';
 
       const opChoices = [
         ['same_day_last_year', 'Same calendar day, last year'],
@@ -2386,7 +2387,8 @@ class Plugin extends AppPlugin {
       tmSec.appendChild(addTmFilter);
 
       const tmExtra = document.createElement('div');
-      tmExtra.style.cssText = 'display:flex;flex-direction:column;gap:10px;margin-top:14px;padding-top:14px;border-top:1px solid rgba(255,255,255,0.06);';
+      tmExtra.style.cssText =
+        'display:flex;flex-direction:column;gap:10px;margin-top:18px;padding-top:16px;border-top:1px solid rgba(255,255,255,0.06);';
       tmExtra.appendChild(this._cfgLabel('Same month/day as journal',
         'Skip the journal year for that filter so notes already listed in Today\'s Notes do not repeat here (on by default).'));
 
@@ -2600,10 +2602,13 @@ class Plugin extends AppPlugin {
     try { s.observer?.disconnect(); } catch (_) {}
     try { s._containerWatcher?.disconnect(); } catch (_) {}
     if (this._tnJournalFooterSuiteEmbed && s.rootEl) {
-      const host = s.rootEl.closest?.('.jfs-shell')?.querySelector?.('.jfs-tn-extras');
+      const host = this._resolveJfsTnExtrasHost(s, s.rootEl);
       if (host) {
         host.innerHTML = '';
         host.style.display = 'none';
+        try {
+          host.style.removeProperty('flex');
+        } catch (_) {}
       }
     }
     try { s.rootEl?.remove(); }       catch (_) {}
@@ -2871,6 +2876,23 @@ class Plugin extends AppPlugin {
     }
   }
 
+  /** Resolve Journal Footer Suite `.jfs-tn-extras` (fallback when tn-footer is not under `.jfs-shell`). */
+  _resolveJfsTnExtrasHost(state, tnRoot) {
+    const fromTn = tnRoot?.closest?.('.jfs-shell')?.querySelector?.('.jfs-tn-extras');
+    if (fromTn) return fromTn;
+    const panelEl = state?.panel?.getElement?.();
+    if (!panelEl) return null;
+    let shell = null;
+    try {
+      const id = String(state.panelId || '');
+      if (id && typeof CSS !== 'undefined' && typeof CSS.escape === 'function') {
+        shell = panelEl.querySelector(`.jfs-shell[data-panel-id="${CSS.escape(id)}"]`);
+      }
+    } catch (_) {}
+    if (!shell) shell = panelEl.querySelector('.jfs-shell');
+    return shell?.querySelector('.jfs-tn-extras') || null;
+  }
+
   _syncTnHeaderExtras(state) {
     const tnRoot = state?.rootEl;
     if (!tnRoot) return;
@@ -2880,8 +2902,9 @@ class Plugin extends AppPlugin {
     /** @type {HTMLElement | null} */
     let jfsHost = null;
 
-    if (this._tnJournalFooterSuiteEmbed) {
-      jfsHost = tnRoot.closest?.('.jfs-shell')?.querySelector?.('.jfs-tn-extras');
+    const suiteDom = !!tnRoot.classList?.contains?.('tn-footer--suite-embed');
+    if (this._tnJournalFooterSuiteEmbed || suiteDom) {
+      jfsHost = this._resolveJfsTnExtrasHost(state, tnRoot);
       if (!jfsHost) return;
       this._ensureJfsTnExtrasShell(state, jfsHost);
       wrap = jfsHost.querySelector('.tn-collapsed-sections-wrap');
@@ -2933,10 +2956,10 @@ class Plugin extends AppPlugin {
     }
 
     if (jfsHost) {
-      const tri = jfsHost.querySelector('.tn-header-tri');
-      const triVisible = tri && tri.style.display !== 'none';
-      const hasChips = wrap.childElementCount > 0;
-      jfsHost.style.display = hasChips || triVisible ? 'flex' : 'none';
+      jfsHost.style.setProperty('display', 'flex', 'important');
+      jfsHost.style.flex = '0 0 auto';
+      jfsHost.style.alignItems = 'center';
+      jfsHost.style.justifyContent = 'flex-end';
     }
   }
 
@@ -3670,10 +3693,15 @@ class Plugin extends AppPlugin {
 
     this._syncFooterTitles();
 
-    bodyEl.innerHTML = '<div class="tn-loading">Loading…</div>';
+    bodyEl.innerHTML = '<div class="tn-loading">Scanning vault…</div>';
 
     try {
-      let results = await this._getRecordsForDate(targetDate);
+      const onScanProgress = (msg) => {
+        if (state.rootEl !== targetRootEl || state.journalDate !== targetDate) return;
+        const el = targetRootEl?.querySelector('.tn-loading');
+        if (el) el.textContent = msg;
+      };
+      let results = await this._getRecordsForDate(targetDate, onScanProgress);
 
       // If rootEl was rebuilt or date changed while we awaited, our results are stale — abort
       if (state.rootEl !== targetRootEl || state.journalDate !== targetDate) {
@@ -4034,7 +4062,7 @@ class Plugin extends AppPlugin {
   // Data fetching
   // =========================================================================
 
-  async _getRecordsForDate(yyyymmdd) {
+  async _getRecordsForDate(yyyymmdd, onProgress) {
     const sig = this._settingsCacheSignature();
     const cacheKey = `${yyyymmdd}::${sig}`;
     const now = Date.now();
@@ -4053,30 +4081,36 @@ class Plugin extends AppPlugin {
     const journalNames = new Set(['journal', 'journals']);
     const collections  = await this.data.getAllCollections();
 
-    const perColl = await Promise.all(
-      collections.map(async (coll) => {
-        const name = coll.getName() || '';
-        if (!name) return [];
-        if (journalNames.has(name.toLowerCase())) return [];
-        if (excludedSet.has(name.toLowerCase())) return [];
+    const toScan = [];
+    for (const coll of collections || []) {
+      const name = coll.getName() || '';
+      if (!name) continue;
+      if (journalNames.has(name.toLowerCase())) continue;
+      if (excludedSet.has(name.toLowerCase())) continue;
+      toScan.push({ coll, name });
+    }
 
-        let records;
-        try { records = await coll.getAllRecords(); } catch (_) { return []; }
+    const results = [];
+    const total = toScan.length;
+    for (let i = 0; i < toScan.length; i++) {
+      const { coll, name } = toScan[i];
+      if (onProgress) {
+        try { onProgress(total ? `Scanning collections… ${i + 1}/${total}` : 'Scanning collections…'); } catch (_) {}
+      }
+      await new Promise((r) => setTimeout(r, 0));
 
-        const collIcon = this._collectionIconName(coll);
-        const matches = [];
-        for (const record of records) {
-          const dateVal = this._getDateFieldValue(record);
-          if (!dateVal) continue;
-          if (dateVal >= dayStart && dateVal <= dayEnd) {
-            matches.push({ record, collectionName: name, dateVal, collectionIcon: collIcon });
-          }
+      let records;
+      try { records = await coll.getAllRecords(); } catch (_) { continue; }
+
+      const collIcon = this._collectionIconName(coll);
+      for (const record of records) {
+        const dateVal = this._getDateFieldValue(record);
+        if (!dateVal) continue;
+        if (dateVal >= dayStart && dateVal <= dayEnd) {
+          results.push({ record, collectionName: name, dateVal, collectionIcon: collIcon });
         }
-        return matches;
-      })
-    );
-
-    const results = perColl.flat();
+      }
+    }
     const mode = this._mainSortMode();
     if (mode === 'chrono') {
       results.sort((a, b) => {
@@ -4521,6 +4555,9 @@ class Plugin extends AppPlugin {
         width: 100%;
         max-width: none;
         align-self: stretch;
+        flex: 0 0 auto;
+        min-width: 0;
+        min-height: 0;
         box-sizing: border-box;
         background: transparent;
         border: none;
