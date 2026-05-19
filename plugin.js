@@ -780,12 +780,66 @@
     return false;
   }
 
+  /** Parse ISO-ish timestamps for vault row scoring (duplicates: pick freshest, not first in list). */
+  function parseVaultIsoMs(s) {
+    const n = Date.parse(String(s || ''));
+    return Number.isFinite(n) ? n : 0;
+  }
+
+  function vaultRowFreshnessScore(r) {
+    let score = 0;
+    let raw = '';
+    try {
+      raw = rowField(r, 'settings_json');
+    } catch (_) {}
+    if (raw && String(raw).trim()) {
+      try {
+        const j = JSON.parse(raw);
+        if (j && typeof j.updatedAt === 'string') {
+          const ms = parseVaultIsoMs(j.updatedAt);
+          if (ms > score) score = ms;
+        }
+      } catch (_) {}
+    }
+    try {
+      const ua = rowField(r, 'updated_at');
+      if (ua) {
+        const ms = parseVaultIsoMs(ua);
+        if (ms > score) score = ms;
+      }
+    } catch (_) {}
+    return score;
+  }
+
+  function settingsJsonPayloadLen(r) {
+    try {
+      return String(rowField(r, 'settings_json') || '').length;
+    } catch (_) {
+      return 0;
+    }
+  }
+
+  /**
+   * Prefer the **newest** vault row when duplicates exist (same `plugin_id`, multiple vault-shaped rows).
+   * Previously the first list match could be stale while a newer row held the real payload.
+   */
   function findVaultRecord(records, pluginId) {
     if (!records) return null;
+    let best = null;
+    let bestScore = -1;
     for (const x of records) {
-      if (isVaultRow(x, pluginId)) return x;
+      if (!isVaultRow(x, pluginId)) continue;
+      const sc = vaultRowFreshnessScore(x);
+      if (sc > bestScore) {
+        bestScore = sc;
+        best = x;
+      } else if (sc === bestScore && best) {
+        const lenX = settingsJsonPayloadLen(x);
+        const lenB = settingsJsonPayloadLen(best);
+        if (lenX > lenB) best = x;
+      }
     }
-    return null;
+    return best;
   }
 
   function applyVaultRowMeta(r, pluginId, coll) {
@@ -2278,20 +2332,25 @@ class Plugin extends AppPlugin {
   }
 
   _settingsCacheSignature() {
-    const pl = String(this._settings?.panelLabel || '').trim().toLowerCase();
+    // Only include settings that change which records match. Display choices are
+    // applied during render so toggling modes does not force another vault scan.
     const fields = Array.isArray(this._settings?.dateFields) ? this._settings.dateFields : [];
     const excluded = Array.isArray(this._settings?.excludedCollections) ? this._settings.excludedCollections : [];
     const f = fields.map((x) => String(x || '').trim().toLowerCase()).filter(Boolean).sort();
     const e = excluded.map((x) => String(x || '').trim().toLowerCase()).filter(Boolean).sort();
-    const tm = this._normalizeTimeMachine(this._settings?.timeMachine);
-    const msm = this._settings?.mainSortMode === 'chrono' ? 'chrono' : 'collection';
-    const ci = this._settings?.chronoShowCollectionIcon !== false;
-    const cn = this._settings?.chronoShowCollectionName !== false;
-    return JSON.stringify({ pl, f, e, tm, msm, ci, cn });
+    return JSON.stringify({ f, e });
   }
 
   _mainSortMode() {
     return this._settings?.mainSortMode === 'chrono' ? 'chrono' : 'collection';
+  }
+
+  _rememberMainSortMode(mode) {
+    const next = mode === 'chrono' ? 'chrono' : mode === 'collection' ? 'collection' : '';
+    if (!next || !this._settings || this._settings.mainSortMode === next) return;
+    this._settings.mainSortMode = next;
+    try { localStorage.setItem(TN_SETTINGS_KEY, JSON.stringify(this._settings)); } catch (_) {}
+    globalThis.ThymerPluginSettings?.scheduleFlush?.(this, () => [TN_SETTINGS_KEY, 'tn_footer_collapsed']);
   }
 
   /** `activeMain`: 'collection' | 'chrono' | null. Initialize once from settings when still undefined. */
@@ -2393,11 +2452,12 @@ class Plugin extends AppPlugin {
    * flushes twice (separate prop writes) and can fall outside our debounce window.
    */
   _onRecordUpdatedForNotes(ev) {
-    if (this._isOtherPluginSettingsRow(ev)) return;
+    if (this._isPluginSettingsRow(ev)) return;
+    if (this._isJournalRecordUpdate(ev)) return;
     this._onWorkspaceDataChanged();
   }
 
-  _isOtherPluginSettingsRow(ev) {
+  _isPluginSettingsRow(ev) {
     const guid = ev?.recordGuid;
     if (!guid) return false;
     let r;
@@ -2411,7 +2471,7 @@ class Plugin extends AppPlugin {
         pluginId = String(p?.get?.() ?? p?.text?.() ?? '').trim();
       }
     } catch (_) {}
-    if (!pluginId || pluginId === TN_SETTINGS_PLUGIN_ID) return false;
+    if (!pluginId) return false;
     let payload = '';
     try {
       payload = String(r.text?.('settings_json') ?? '').trim();
@@ -2421,6 +2481,15 @@ class Plugin extends AppPlugin {
       }
     } catch (_) {}
     return !!payload;
+  }
+
+  _isJournalRecordUpdate(ev) {
+    const guid = ev?.recordGuid;
+    if (!guid) return false;
+    let r;
+    try { r = this.data.getRecord?.(guid); } catch (_) { r = null; }
+    if (!r) return false;
+    return !!this._journalDayKeyFromRecord(r);
   }
 
   _onWorkspaceDataChanged() {
@@ -3072,7 +3141,10 @@ class Plugin extends AppPlugin {
       e.preventDefault();
       e.stopPropagation();
       if (state.activeMain === 'collection') state.activeMain = null;
-      else state.activeMain = 'collection';
+      else {
+        state.activeMain = 'collection';
+        this._rememberMainSortMode('collection');
+      }
       this._maybeCollapseEntireFooterIfTriAllOff(state);
       this._renderFooterBody(state);
       this._syncTnHeaderExtras(state);
@@ -3083,7 +3155,10 @@ class Plugin extends AppPlugin {
       e.preventDefault();
       e.stopPropagation();
       if (state.activeMain === 'chrono') state.activeMain = null;
-      else state.activeMain = 'chrono';
+      else {
+        state.activeMain = 'chrono';
+        this._rememberMainSortMode('chrono');
+      }
       this._maybeCollapseEntireFooterIfTriAllOff(state);
       this._renderFooterBody(state);
       this._syncTnHeaderExtras(state);
