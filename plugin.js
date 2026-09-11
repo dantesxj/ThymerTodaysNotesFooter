@@ -2156,7 +2156,7 @@
     title.textContent = label + ' — where to store settings?';
     title.style.cssText = 'font-weight:700;font-size:15px;margin-bottom:10px;';
     const hint = document.createElement('div');
-    hint.textContent = 'Change later via Command Palette → “Storage location…”';
+    hint.textContent = 'Change later via Command Palette → “Plugin Backend: Storage modes…”';
     hint.style.cssText = 'font-size:12px;color:var(--text-muted,#888);margin-bottom:16px;line-height:1.45;';
     const mk = (t, sub, prim) => {
       const b = document.createElement('button');
@@ -2471,20 +2471,6 @@ class Plugin extends AppPlugin {
       this.ui.addCommandPaletteCommand({
         label: "Today's Notes: Settings", icon: 'ti-settings',
         onSelected: () => this._openSettings(),
-      });
-      this.ui.addCommandPaletteCommand({
-        label: "Today's Notes: Storage location…", icon: 'ti-database',
-        onSelected: () => {
-        globalThis.ThymerPluginSettings?.openStorageDialog?.({
-          plugin: this,
-          pluginId: TN_SETTINGS_PLUGIN_ID,
-          modeKey: 'thymerext_ps_mode_todays-notes',
-          mirrorKeys: () => [TN_SETTINGS_KEY, 'tn_footer_collapsed'],
-          label: "Today's Notes",
-          data: this.data,
-          ui: this.ui,
-        });
-      },
       });
 
       this._eventHandlerIds.push(this.events.on('panel.navigated', ev => setTimeout(() => this._handlePanel(ev.panel), 400)));
